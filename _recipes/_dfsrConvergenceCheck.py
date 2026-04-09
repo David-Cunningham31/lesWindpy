@@ -18,9 +18,10 @@ import windlespy as LES
 sys.path.remove(windlespy_path)
 
 #%%
-case_path = r"/home/people/20397873/LES/DFSR_testing/empty_domain"
+case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
 
 variable_dict = LES._caseFiles.parse_setup_file(case_path)
+perc_err_for_convergence = 10
 
 #%%
 
@@ -61,7 +62,7 @@ errs_array, max_re_stress_err = LES._profileAnalysis.max_percent_block_errors(re
 initializing_time = 12.5*t_star
 stat_avg_time = 40*t_star
 
-can_les_finish = LES._profileAnalysis.can_LES_finish(time_steps, max_re_stress_err, initializing_time, stat_avg_time)
+can_les_finish = LES._profileAnalysis.can_LES_finish(time_steps, max_re_stress_err, initializing_time, stat_avg_time, perc_err_for_convergence)
 
 #%%
 

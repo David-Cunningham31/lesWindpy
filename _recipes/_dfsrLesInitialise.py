@@ -19,7 +19,7 @@ sys.path.remove(windlespy_path)
 
 
 #%%
-case_path = r"/home/people/20397873/LES/DFSR_testing/empty_domain"
+case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
 
 variable_dict = LES._caseFiles.parse_setup_file(case_path)
 
@@ -42,10 +42,9 @@ t_star = LES._profileAnalysis.calculate_t_star(u_star_fit, domain_height)
 #%%
 
 dfsr_les_init_dict = {"t_star" : t_star,
-                      "init_time" : 12.5*t_star,
-                      "time_chunk" : 10*t_star,
+                      "burn_in_time" : 20*t_star,
                       "min_avg_time" : 40*t_star,
-                      "initial_sim_duration" : (40*t_star + 12.5*t_star)}
+                      "initial_sim_duration" : (40*t_star + 20*t_star)}
 
 #%%
 

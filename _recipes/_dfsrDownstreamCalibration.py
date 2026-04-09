@@ -8,6 +8,7 @@ Created on Sat Mar 14 17:32:56 2026
 import logging
 import numpy as np
 import pandas as pd
+import json
 import os
 import sys
 import shutil
@@ -21,13 +22,23 @@ sys.path.remove(windlespy_path)
 #%% 
 # USER INPUTS:
 
-case_path = r"/home/people/20397873/LES/DFSR_testing/empty_domain"
-building_height = 1
-lower_z_threshold = 0.25*building_height
-upper_z_thresold = 1.5*building_height
-rmse_threshold = 0.05
-time_step = 0.002
+case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
 downstream_probes_folder = os.path.join(case_path, "postProcessing", "probes2")
+
+#%%
+variable_dict = LES._caseFiles.parse_setup_file(case_path)
+
+building_height = variable_dict['buildingHeight']
+lower_z_threshold = variable_dict['lowerZThreshold']
+upper_z_thresold = variable_dict['upperZThreshold']
+rmse_threshold = variable_dict['rmseThreshold']
+
+json_path = os.path.join(case_path, "log", "downstreamCalibration", "sim_init.json")
+
+with open(json_path, "r") as f:
+    dfsr_les_init_dict = json.load(f)
+
+burn_in_time = dfsr_les_init_dict["burn_in_time"]
 
 #%%
 
@@ -41,7 +52,9 @@ vel_array_3d = LES._profileAnalysis.get_velocity_components(downstream_probes_fo
 
 time_steps = LES._profileAnalysis.get_time_steps_probe_data(downstream_probes_folder)
 
-downstream_profile_array = LES._profileCalibration.get_downstream_dfsr_profile_array(vel_array_3d, time_step)
+time_step = np.mean(np.diff(time_steps))
+
+downstream_profile_array = LES._profileCalibration.get_downstream_dfsr_profile_array(vel_array_3d, time_step, inlet_or_downstream="downstream", burn_in_time=burn_in_time, time_steps=time_steps)
 
 #%%
 
@@ -51,7 +64,7 @@ rmse_array = LES._profileCalibration.get_rmse(downstream_profile_array, target_p
 
 #%%
 
-iter_status = LES._profileCalibration.dfsr_iter_status(case_path, rmse_array, rmse_threshold)
+iter_status = LES._profileCalibration.dfsr_iter_status(case_path, rmse_array, rmse_threshold, "downstream")
 
 LES._caseFiles.write_dfsr_iter_json(case_path, iter_status, "downstream")
 
@@ -60,7 +73,7 @@ LES._caseFiles.write_dfsr_iter_json(case_path, iter_status, "downstream")
 converged = iter_status["converged"]
 stagnated = iter_status["stagnated"]
 
-if (not converged) or (not stagnated):
+if (not converged) and (not stagnated):
     
     new_inlet_profile_array = LES._profileCalibration.new_dfsr_profile_array(current_profile_array, target_profile_array, downstream_profile_array, relaxation_factor=0.9)
     

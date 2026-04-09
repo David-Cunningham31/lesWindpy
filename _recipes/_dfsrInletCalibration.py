@@ -21,13 +21,15 @@ sys.path.remove(windlespy_path)
 #%% 
 # USER INPUTS:
 
-case_path = r"/home/people/20397873/LES/DFSR_testing/empty_domain"
-building_height = 1
-lower_z_threshold = 0.25*building_height
-upper_z_thresold = 1.5*building_height
-rmse_threshold = 0.05
-time_step = 0.002
+case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
 
+#%%
+variable_dict = LES._caseFiles.parse_setup_file(case_path)
+
+building_height = variable_dict['buildingHeight']
+lower_z_threshold = variable_dict['lowerZThreshold']
+upper_z_thresold = variable_dict['upperZThreshold']
+rmse_threshold = variable_dict['rmseThreshold']
 
 #%%
 
@@ -41,6 +43,8 @@ vel_array_3d = LES._profileCalibration.dfsr_vel_array(case_path)
 
 time_steps = LES._profileCalibration.get_time_steps_dfsr_data(case_path)
 
+time_step = np.mean(np.diff(time_steps))
+
 inlet_profile_array = LES._profileCalibration.get_downstream_dfsr_profile_array(vel_array_3d, time_step)
 
 #%%
@@ -51,7 +55,7 @@ rmse_array = LES._profileCalibration.get_rmse(inlet_profile_array, target_profil
 
 #%%
 
-iter_status = LES._profileCalibration.dfsr_iter_status(case_path, rmse_array, rmse_threshold)
+iter_status = LES._profileCalibration.dfsr_iter_status(case_path, rmse_array, rmse_threshold, "inlet")
 
 LES._caseFiles.write_dfsr_iter_json(case_path, iter_status, "inlet")
 
@@ -60,7 +64,7 @@ LES._caseFiles.write_dfsr_iter_json(case_path, iter_status, "inlet")
 converged = iter_status["converged"]
 stagnated = iter_status["stagnated"]
 
-if (not converged) or (not stagnated):
+if (not converged) and (not stagnated):
     
     new_inlet_profile_array = LES._profileCalibration.new_dfsr_profile_array(current_profile_array, target_profile_array, inlet_profile_array, relaxation_factor=0.9)
     

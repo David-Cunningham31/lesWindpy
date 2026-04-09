@@ -22,6 +22,43 @@ sys.path.remove(windlespy_path)
 
 #%%
 
+def get_iter_cal_profiles(case_path, inlet_or_downstream="inlet"):
+    
+    iter_profile_dict = {}
+    
+    if inlet_or_downstream=="inlet":
+        iter_profiles_folder = os.path.join(case_path,"log", "inletCalibration")
+    else:
+        iter_profiles_folder = os.path.join(case_path,"log", "downstreamCalibration")
+    
+    for iter_desc in os.listdir(iter_profiles_folder):
+        
+        iter_profile_dict[iter_desc] = {}
+        
+        inlet_profile_path = os.path.join(iter_profiles_folder, iter_desc, "inletProfile")
+        post_corr_inlet_profile_path = os.path.join(iter_profiles_folder, iter_desc, "postCorrectionProfile")
+        new_inlet_profile_path = os.path.join(iter_profiles_folder, iter_desc, "newInletProfile")
+        
+        columns=["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
+        
+        inlet_profile_df=pd.read_csv(inlet_profile_path, sep=r"\s+", header=None)
+        inlet_profile_df.columns = columns
+        post_corr_inlet_profile_df=pd.read_csv(post_corr_inlet_profile_path, sep=r"\s+", header=None)
+        post_corr_inlet_profile_df.columns = columns
+        if "newInletProfile" in os.listdir(os.path.join(iter_profiles_folder, iter_desc)):
+            new_inlet_profile_df=pd.read_csv(new_inlet_profile_path, sep=r"\s+", header=None)
+            new_inlet_profile_df.columns = columns
+            iter_profile_dict[iter_desc]["new_inlet_profile"] = new_inlet_profile_df
+        else:
+            iter_profile_dict[iter_desc]["new_inlet_profile"] = "NA"
+        
+        iter_profile_dict[iter_desc]["inlet_profile"] = inlet_profile_df
+        iter_profile_dict[iter_desc]["post_corr_profile"] = post_corr_inlet_profile_df
+        
+    return iter_profile_dict
+        
+#%%
+
 def get_dfsr_target_profile_df(case_path):
     
     profile_path = os.path.join(case_path,'constant','boundaryData','windProfile')
@@ -37,8 +74,6 @@ def get_dfsr_target_profile_df(case_path):
     
     columns=["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
     target_profile_df.columns = columns
-
-    target_profile_df.columns=columns
     
     return target_profile_df
 
@@ -122,18 +157,36 @@ def get_time_steps_dfsr_data(case_path):
 
 #%%
 
-def get_downstream_dfsr_profile_array(vel_array_3d, time_step):
+def get_downstream_dfsr_profile_array(vel_array_3d, time_step, inlet_or_downstream="inlet", burn_in_time=None, time_steps=None):
     
-    mean_vel_array_2d = LES._profileAnalysis.mean_vel(vel_array_3d)
-    fluc_vel_array_3d = LES._profileAnalysis.fluc_vel(vel_array_3d, mean_vel_array_2d)
-    re_stresses = LES._profileAnalysis.re_stresses(fluc_vel_array_3d)
+    if inlet_or_downstream=="inlet":
+        mean_vel_array_2d = LES._profileAnalysis.mean_vel(vel_array_3d)
+        fluc_vel_array_3d = LES._profileAnalysis.fluc_vel(vel_array_3d, mean_vel_array_2d)
+        re_stresses = LES._profileAnalysis.re_stresses(fluc_vel_array_3d)
 
-    int_time_scales = LES._profileAnalysis.int_time_scale(fluc_vel_array_3d, time_step)
-    int_length_scales = LES._profileAnalysis.int_length_scales(int_time_scales, mean_vel_array_2d)
+        int_time_scales = LES._profileAnalysis.int_time_scale(fluc_vel_array_3d, time_step)
+        int_length_scales = LES._profileAnalysis.int_length_scales(int_time_scales, mean_vel_array_2d)
+            
+        downstream_profile = np.stack( [mean_vel_array_2d[0], re_stresses[0],
+                                        re_stresses[1], re_stresses[2], int_length_scales[0],
+                                        int_length_scales[1], int_length_scales[2] ], axis = 1)
+
+    else:
         
-    downstream_profile = np.stack( [mean_vel_array_2d[0], re_stresses[0],
-                                      re_stresses[1], re_stresses[2], int_length_scales[0],
-                                      int_length_scales[1], int_length_scales[2] ], axis = 1)
+        mask = (time_steps>burn_in_time)
+
+        vel_array_3d = vel_array_3d[:,mask,:]
+
+        mean_vel_array_2d = LES._profileAnalysis.mean_vel(vel_array_3d)
+        fluc_vel_array_3d = LES._profileAnalysis.fluc_vel(vel_array_3d, mean_vel_array_2d)
+        re_stresses = LES._profileAnalysis.re_stresses(fluc_vel_array_3d)
+
+        int_time_scales = LES._profileAnalysis.int_time_scale(fluc_vel_array_3d, time_step)
+        int_length_scales = LES._profileAnalysis.int_length_scales(int_time_scales, mean_vel_array_2d)
+            
+        downstream_profile = np.stack( [mean_vel_array_2d[0], re_stresses[0],
+                                        re_stresses[1], re_stresses[2], int_length_scales[0],
+                                        int_length_scales[1], int_length_scales[2] ], axis = 1)
     
     return downstream_profile
 
@@ -185,51 +238,69 @@ def get_rmse(downstream_profile, target_profile, lower_z_threshold_id, upper_z_t
 
 #%% 
 
-def dfsr_iter_status(case_path, rmse_array, rmse_threshold):
+def dfsr_iter_status(case_path, rmse_array, rmse_threshold, inlet_or_downstream="inlet"):
     
-    dfsr_inlet_iter_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", "inletCalibration")
+    if inlet_or_downstream == "inlet":
+        dfsr_iter_path = os.path.join(case_path, "log", "inletCalibration")
+    elif inlet_or_downstream == "downstream":
+        dfsr_iter_path = os.path.join(case_path, "log", "downstreamCalibration")
+    else:
+        raise ValueError("inlet_or_downstream must be 'inlet' or 'downstream'")
     
-    os.makedirs(dfsr_inlet_iter_path, exist_ok=True)
+    os.makedirs(dfsr_iter_path, exist_ok=True)
     
-    iteration_list = os.listdir(dfsr_inlet_iter_path)
+    iteration_list = [
+        d for d in os.listdir(dfsr_iter_path)
+        if d.startswith("iteration") and os.path.isdir(os.path.join(dfsr_iter_path, d))
+    ]
     
-    worst_rmse = np.max(rmse_array)
+    worst_rmse = float(np.max(rmse_array))
     
-    if len(iteration_list)==0:
+    if len(iteration_list) == 0:
         iteration = 1
-        improvement_ratio = "NA"
+        improvement_ratio = None
         stagnated = False
     else:
-        max_iter = 0
+        iter_nums = []
         for iteration_str in iteration_list:
-            iteration = int(iteration_str[-1])
-            if iteration>max_iter:
-                max_iter=iteration
-        
-        iteration = max_iter + 1
-        
-        prev_iter_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", "inletCalibration", f"iteration{max_iter}")
-        prev_iter_json = os.path.join(prev_iter_path,f"iteration{max_iter}.json")
-        
-        with open(prev_iter_json, "r") as f:
-            prev_rmse = json.load(f).get("worst_nrmse")
-            
-        improvement_ratio = worst_rmse / prev_rmse
-        
-        if improvement_ratio > 0.98:
-            stagnated = True
-    
-    if worst_rmse <= rmse_threshold:
-        converged = True
-    else:
-        converged = False
-        
+            try:
+                iter_nums.append(int(iteration_str.replace("iteration", "")))
+            except ValueError:
+                pass
+
+        if len(iter_nums) == 0:
+            iteration = 1
+            improvement_ratio = None
+            stagnated = False
+        else:
+            max_iter = max(iter_nums)
+            iteration = max_iter + 1
+
+            prev_iter_json = os.path.join(
+                dfsr_iter_path,
+                f"iteration{max_iter}",
+                f"iteration{max_iter}.json"
+            )
+
+            with open(prev_iter_json, "r") as f:
+                prev_rmse = json.load(f).get("worst_rmse")
+
+            if prev_rmse is None or prev_rmse == 0:
+                improvement_ratio = None
+                stagnated = False
+            else:
+                improvement_ratio = float(worst_rmse / prev_rmse)
+                stagnated = bool(improvement_ratio > 0.98)
+
+    converged = bool(worst_rmse <= rmse_threshold)
+
     iter_status = {
-        "iteration" : iteration,
-        "converged" : converged,
-        "stagnated" : stagnated,
-        "worst_rmse" : worst_rmse,
-        "improvement_ratio" : improvement_ratio}
-    
+        "iteration": int(iteration),
+        "converged": bool(converged),
+        "stagnated": bool(stagnated),
+        "worst_rmse": float(worst_rmse),
+        "improvement_ratio": None if improvement_ratio is None else float(improvement_ratio)
+    }
+
     return iter_status
     

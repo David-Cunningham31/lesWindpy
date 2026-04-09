@@ -117,220 +117,28 @@ def norm_heights(z, body_dim):
 
 #%%
 
-def plot_ti_u(ti_array_3d, norm_heights):
-        
+def plot_profile(array, norm_heights, x_label, y_label, xlims=None, ylims=None, several=False, descs=None):
     fig, ax = plt.subplots()
-
-    ax.plot(ti_array_3d[0], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$I_{u}$ [%]')
-    ax.set_ylabel(r'z/H')
     
-    ax.minorticks_on()
+    if not several:
+        ax.plot(array, norm_heights)
+    else:        
+        for profile,desc in zip(array,descs):
+            ax.plot(profile, norm_heights, label=desc)
+        ax.legend()
     
-    return fig
-
-#%%
-
-def plot_ti_v(ti_array_3d, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(ti_array_3d[1], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$I_{v}$ [%]')
-    ax.set_ylabel(r'z/H')
+    if xlims==None:
+        ax.set_xlim(0, None)
+    else:
+        ax.set_xlim(xlims[0], xlims[1])
     
-    ax.minorticks_on()
-    
-    return fig
+    if ylims==None:
+        ax.set_ylim(0, None)
+    else:
+        ax.set_ylim(ylims[0], ylims[1])
 
-#%%
-
-def plot_ti_w(ti_array_3d, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(ti_array_3d[2], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$I_{w}$ [%]')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_re_stress_11(re_stresses, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(re_stresses[0], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$\overline{u^\prime u^\prime} \quad [m^{2}/s^{2}]$')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_re_stress_22(re_stresses, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(re_stresses[1], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$\overline{v^\prime v^\prime} \quad [m^{2}/s^{2}]$')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_re_stress_33(re_stresses, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(re_stresses[2], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$\overline{w^\prime w^\prime} \quad [m^{2}/s^{2}]$')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_re_stress_31(re_stresses, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(re_stresses[3], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$\overline{u^\prime w^\prime} \quad [m^{2}/s^{2}]$')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_t_u(int_time_scales, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(int_time_scales[0], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$T_{u}^{x}$ [s]')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_t_v(int_time_scales, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(int_time_scales[1], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$T_{v}^{x}$ [s]')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_t_w(int_time_scales, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(int_time_scales[2], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$T_{v}^{x}$ [s]')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_l_u(int_len_scales, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(int_len_scales[0], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$L_{u}^{x}$ [m]')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_l_v(int_len_scales, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(int_len_scales[1], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$L_{v}^{x}$ [m]')
-    ax.set_ylabel(r'z/H')
-    
-    ax.minorticks_on()
-    
-    return fig
-
-#%%
-
-def plot_l_w(int_len_scales, norm_heights):
-        
-    fig, ax = plt.subplots()
-
-    ax.plot(int_len_scales[2], norm_heights)
-
-    ax.set_xlim(0, None)
-    ax.set_ylim(0, None)
-    ax.set_xlabel(r'$L_{w}^{x}$ [m]')
-    ax.set_ylabel(r'z/H')
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     
     ax.minorticks_on()
     

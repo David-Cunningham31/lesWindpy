@@ -11,8 +11,17 @@ import logging
 import numpy as np
 from scipy.signal import correlate
 from scipy.signal import welch
+from scipy.optimize import root_scalar
+import os
+import sys
 
 logger = logging.getLogger(__name__)
+
+cwd = os.path.dirname(os.path.abspath(__file__))
+windlespy_path = os.path.abspath(os.path.join(cwd, "..", ".."))
+sys.path.append(windlespy_path)
+import windlespy as LES
+sys.path.remove(windlespy_path)
 
 #%%
 
@@ -202,7 +211,7 @@ def int_length_scales(int_time_scales, mean_vel_array_2d):
     
     # Calculate integral length scales using Taylor's Hypothesis: L=TU:
     
-    int_length_scales = int_time_scales * mean_vel_array_2d
+    int_length_scales = int_time_scales * mean_vel_array_2d[0,:]
     
     return int_length_scales
 
@@ -308,3 +317,78 @@ def target_profile_re_stresses(target_profile_df):
     target_profile_df["R_33"] = (target_profile_df["Iw"] * target_profile_df["U"])**2
 
     return target_profile_df
+
+#%%
+
+def get_n_c(delta, frequency_energy):
+    n_c = (np.pi * frequency_energy)/(delta**2)
+    
+    return n_c
+
+#%%
+
+def get_von_karman_red_fs(n_c, int_length_scales, U):
+    von_karman_red_fs = (n_c*int_length_scales)/U
+    
+    return von_karman_red_fs
+
+#%%
+
+def get_frequency_energy(n_c, L, U_z, sigmas_z):
+    von_karman_red_fs = get_von_karman_red_fs(n_c, L, U_z)
+    
+    von_karman_spectra_arrays = []
+    
+    for red_fs, vel_comp, sigma in zip(von_karman_red_fs,["u","v","w"], sigmas_z):
+        non_dim_von_karman_spectrum = LES._profileAnalysis.von_karman_spectra(red_fs, vel_comp)
+        von_karman_spectrum = (non_dim_von_karman_spectrum * (sigma**2)) / n_c
+        von_karman_spectra_arrays.append(von_karman_spectrum)
+        
+    von_karman_spectra = np.stack(von_karman_spectra_arrays, axis = 0)
+    
+    frequency_energy = np.sum(von_karman_spectra)
+
+    return frequency_energy
+
+#%%
+
+def get_delta(frequency_energy, n_c):
+    delta = np.sqrt((np.pi / n_c) * frequency_energy)
+    
+    return delta
+
+#%%
+
+def residual(n_c, delta, L, U_z, sigmas_z):
+    
+    frequency_energy = get_frequency_energy(n_c, L, U_z, sigmas_z)
+    
+    return ((delta**2) * n_c) - (np.pi * frequency_energy)
+
+#%%
+
+def get_mesh_cutoff_frequencies(delta, z_array, U, int_length_scales, sigmas):
+    
+    n_c = np.full(len(z_array), np.nan)
+    
+    for i in range(len(z_array)):
+        
+        U_z = U[i]
+        
+        L = int_length_scales[:,i]
+        
+        sigmas_z = sigmas[:,i]
+        
+        a = 1e-6
+        b = 1e6
+        
+        sol = root_scalar(
+            residual,
+            args=(delta, L, U_z, sigmas_z),
+            bracket=[a, b],
+            method="brentq"
+        )
+        
+        n_c[i] = sol.root
+    
+    return n_c

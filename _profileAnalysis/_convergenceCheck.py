@@ -10,6 +10,9 @@ Module for checking whether the turbulence statistics from an OpenFOAM simulatio
 from scipy.optimize import curve_fit
 import logging
 import numpy as np
+import pandas as pd
+import re
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +43,12 @@ def fit_log_law(U, z, zmin = None, zmax = None):
     def loglaw(z, u_star, z0):
         return (u_star/kappa) * np.log((z + z0)/z0)
     
-    mask = np.isfinite(z) & np.isfinite(U) & (z > 0)
+    if (zmin != None) and (zmax != None):
+        mask = np.isfinite(z) & np.isfinite(U) & (z > zmin) & (z < zmax)
+    else:
+        mask = np.isfinite(z) & np.isfinite(U) & (z > 0)
+        
+        
     zf, Uf = z[mask], U[mask]
     
     p0 = (1, 0.1)  # initial guesses (u*, z0)
@@ -283,3 +291,64 @@ def can_LES_finish(time_steps, max_re_stress_err, initializing_time, stat_avg_ti
         return True
     else:
         return False
+
+#%%
+
+def get_cfl_df(case_path):
+    
+    logfile = os.path.join(case_path,"pisFoam_burn_in.log")
+
+    time_pattern = re.compile(r"^Time =\s+([0-9Ee+\-\.]+)")
+    co_pattern = re.compile(
+        r"Courant Number mean:\s*([0-9Ee+\-\.]+)\s*max:\s*([0-9Ee+\-\.]+)"
+    )
+
+    rows = []
+    current_time = None
+
+    with open(logfile, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+
+            m_time = time_pattern.match(line)
+            if m_time:
+                current_time = float(m_time.group(1))
+                continue
+
+            m_co = co_pattern.search(line)
+            if m_co and current_time is not None:
+                co_mean = float(m_co.group(1))
+                co_max = float(m_co.group(2))
+                rows.append((current_time, co_mean, co_max))
+
+    cfl_df = pd.DataFrame(rows, columns=["time", "Co_mean", "Co_max"])
+    cfl_df["deltaT"] = cfl_df["time"].diff()
+
+    return cfl_df
+
+#%%
+
+def get_cfl_time_step_dict(cfl_df, cfl_percentile, deltaT_percentile):
+
+    deltaT_10th_percentile = cfl_df["deltaT"].quantile(0.10)
+    deltaT_5th_percentile = cfl_df["deltaT"].quantile(0.05)
+    deltaT_median = cfl_df["deltaT"].median()
+    deltaT_sim = cfl_df["deltaT"].quantile(deltaT_percentile/100)
+    
+    max_cfl_mean = cfl_df["Co_max"].mean()
+    max_cfl_95th_percentile = cfl_df["Co_max"].quantile(0.95)
+    max_cfl_max = cfl_df["Co_max"].quantile(0.95)
+    cfl_sim = cfl_df["Co_max"].quantile(cfl_percentile/100)
+    
+    cfl_time_step_dict = {
+        "deltaT_10th_percentile": deltaT_10th_percentile,
+        "deltaT_5th_percentile": deltaT_5th_percentile,
+        "deltaT_median": deltaT_median,
+        "deltaT_sim": deltaT_sim,
+        "max_cfl_mean": max_cfl_mean,
+        "max_cfl_95th_percentile": max_cfl_95th_percentile,
+        "max_cfl_max": max_cfl_max,
+        "cfl_sim": cfl_sim,
+        }
+    
+    return cfl_time_step_dict

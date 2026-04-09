@@ -12,6 +12,18 @@ import json
 
 #%%
 
+def write_dfsr_inlet_profile(target_profile_df, case_path):
+        
+    output_path = os.path.join(case_path,'constant','boundaryData','windProfile','profile')
+    
+    np.savetxt(
+        output_path,
+        target_profile_df.to_numpy(),
+        fmt="%.6f",
+        delimiter="\t")
+    
+#%%
+
 def write_dfsr_samp_pts(x_coord, y_coord, case_path, target_profile_df):
     
     z_coord_strs = (target_profile_df["z"].astype(str) + ")").to_numpy()
