@@ -290,7 +290,7 @@ def dfsr_iter_status(case_path, rmse_array, rmse_threshold, inlet_or_downstream=
                 stagnated = False
             else:
                 improvement_ratio = float(worst_rmse / prev_rmse)
-                stagnated = bool(improvement_ratio > 0.98)
+                stagnated = bool(0.98 <= improvement_ratio <= 1.02)
 
     converged = bool(worst_rmse <= rmse_threshold)
 
@@ -299,7 +299,14 @@ def dfsr_iter_status(case_path, rmse_array, rmse_threshold, inlet_or_downstream=
         "converged": bool(converged),
         "stagnated": bool(stagnated),
         "worst_rmse": float(worst_rmse),
-        "improvement_ratio": None if improvement_ratio is None else float(improvement_ratio)
+        "improvement_ratio": None if improvement_ratio is None else float(improvement_ratio),
+        "U_rmse" : rmse_array[0],
+        "R_11_rmse" : rmse_array[1],
+        "R_22_rmse" : rmse_array[2],
+        "R_33_rmse" : rmse_array[3],
+        "L_u_rmse" : rmse_array[4],
+        "L_v_rmse" : rmse_array[5],
+        "L_w_rmse" : rmse_array[6]
     }
 
     return iter_status
