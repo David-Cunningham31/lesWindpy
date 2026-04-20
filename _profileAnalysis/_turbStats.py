@@ -9,6 +9,7 @@ Module to calculate wind profiles obtained from OpenFOAM simulations.
 
 import logging
 import numpy as np
+import pandas as pd
 from scipy.signal import correlate
 from scipy.signal import welch
 from scipy.optimize import root_scalar
@@ -327,10 +328,51 @@ def get_n_c(delta, frequency_energy):
 
 #%%
 
-def get_von_karman_red_fs(n_c, int_length_scales, U):
-    von_karman_red_fs = (n_c*int_length_scales)/U
-    
-    return von_karman_red_fs
+def get_von_karman_red_fs(freq_array, int_length_scales, U):
+    """
+    Compute reduced frequencies for von Karman spectra.
+
+    Supported input cases
+    ---------------------
+    1) Full profile case:
+       freq_array         : (nFreq,)
+       int_length_scales  : (nHeights, 3)
+       U                  : (nHeights,)
+       returns            : (nHeights, 3, nFreq)
+
+    2) Single-height scalar-frequency case:
+       freq_array         : scalar
+       int_length_scales  : (3,)
+       U                  : scalar
+       returns            : (3,)
+    """
+
+    f = np.asarray(freq_array, dtype=float)
+    L = np.asarray(int_length_scales, dtype=float)
+    U = np.asarray(U, dtype=float)
+
+    # Case 1: scalar frequency, one height, 3 components
+    if f.ndim == 0 and L.ndim == 1 and U.ndim == 0:
+        return (f * L) / U
+
+    # Case 2: frequency array, one height, 3 components
+    if f.ndim == 1 and L.ndim == 1 and U.ndim == 0:
+        return (L[:, np.newaxis] * f[np.newaxis, :]) / U
+
+    # Case 3: scalar frequency, multiple heights
+    if f.ndim == 0 and L.ndim == 2 and U.ndim == 1:
+        return (f * L) / U[:, np.newaxis]
+
+    # Case 4: original full-profile case
+    if f.ndim == 1 and L.ndim == 2 and U.ndim == 1:
+        return (
+            f[np.newaxis, np.newaxis, :] * L[:, :, np.newaxis]
+        ) / U[:, np.newaxis, np.newaxis]
+
+    raise ValueError(
+        f"Unsupported shapes in get_von_karman_red_fs: "
+        f"freq_array {f.shape}, int_length_scales {L.shape}, U {U.shape}"
+    )
 
 #%%
 
@@ -367,11 +409,11 @@ def residual(n_c, delta, L, U_z, sigmas_z):
 
 #%%
 
-def get_mesh_cutoff_frequencies(delta, z_array, U, int_length_scales, sigmas):
+def get_mesh_cutoff_frequencies(delta, U, int_length_scales, sigmas):
     
-    n_c = np.full(len(z_array), np.nan)
+    n_c = np.full(len(U), np.nan)
     
-    for i in range(len(z_array)):
+    for i in range(len(U)):
         
         U_z = U[i]
         
@@ -392,3 +434,110 @@ def get_mesh_cutoff_frequencies(delta, z_array, U, int_length_scales, sigmas):
         n_c[i] = sol.root
     
     return n_c
+
+
+#%%
+
+def wong_kernel_smooth(y, n=3):
+    y = np.asarray(y, dtype=float)
+
+    if n <= 1:
+        return y.copy()
+
+    kernel = np.ones(n, dtype=float) / n
+    pad_left = n // 2
+    pad_right = n - 1 - pad_left
+
+    y_pad = np.pad(y, (pad_left, pad_right), mode="edge")
+    y_smooth = np.convolve(y_pad, kernel, mode="valid")
+
+    return y_smooth
+#%%
+
+def smooth_profiles(profiles, z_array, ti_smooth_num, l_smooth_num, structure_height):
+    """
+    Function which smooths profiles from a profile dataFrame.
+    
+    ti_smooth_num is the number of vertical points for smoothing of the turbulence intensity profiles.
+    
+    l_smooth_num is the number of vertical points for smoothing of the turbulence intensity profiles.
+
+    """
+   
+    new_profile_df_dic = {}
+    
+    if isinstance(profiles, pd.DataFrame):
+    
+        for column in profiles.columns:
+            
+            if column!="z":
+            
+                orig_profile = profiles[column].to_numpy()
+                
+                if "L" in column:
+                    smooth_profile = wong_kernel_smooth(orig_profile, n=l_smooth_num)
+                else:
+                    smooth_profile = wong_kernel_smooth(orig_profile, n=ti_smooth_num)
+                
+                profile_array = np.stack([orig_profile,smooth_profile], axis=0)
+                norm_heights = profiles["z"]/structure_height
+                
+                new_profile_df_dic[column] = smooth_profile
+                
+                x_label = column
+                y_label = r"$\frac{z}{H}$"
+                
+                descs = ["Original", "Smoothed"]
+                
+                xlims = [0, np.max(profile_array)]
+                ylims = [0, 3]
+                
+                fig = LES._plot.plot_profile(profile_array, norm_heights, x_label, y_label, xlims, ylims, several=True, descs=descs)
+                
+                fig.show()
+                
+            else:
+                new_profile_df_dic[column] = profiles[column].to_numpy()
+            
+        new_profile_df = pd.DataFrame(new_profile_df_dic)
+        new_profile_df = new_profile_df.sort_values("z")
+            
+            
+        return new_profile_df
+    
+    elif isinstance(profiles, np.ndarray):
+        
+        smooth_profile_list = []
+        
+        for column, x_label in zip(list(range(np.shape(profiles)[1])), ["U","R_11","R_22","R_33","Lu","Lv","Lw"]):
+        
+            orig_profile = profiles[:,column]
+            
+            if column in [4,5,6]:
+                smooth_profile = wong_kernel_smooth(orig_profile, n=l_smooth_num)
+            else:
+                smooth_profile = wong_kernel_smooth(orig_profile, n=ti_smooth_num)
+            
+            profile_array = np.stack([orig_profile,smooth_profile], axis=0)
+            norm_heights = z_array/structure_height
+            
+            smooth_profile_list.append(smooth_profile)
+            
+            y_label = r"$\frac{z}{H}$"
+            
+            descs = ["Original", "Smoothed"]
+            
+            xlims = [0, np.max(profile_array)]
+            ylims = [0, 3]
+            
+            fig = LES._plot.plot_profile(profile_array, norm_heights, x_label, y_label, xlims, ylims, several=True, descs=descs)
+            
+            fig.show()
+            
+        smooth_profile_array = np.stack(smooth_profile_list,axis=1)           
+            
+        return smooth_profile_array
+    
+    
+    
+    

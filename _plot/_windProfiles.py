@@ -146,49 +146,20 @@ def plot_profile(array, norm_heights, x_label, y_label, xlims=None, ylims=None, 
 
 #%%
 
-def plot_s_uu(LES_reduced_fs, LES_spectrum, vk_red_fs=None, vk_spectrum=None):
+def plot_spectra(fs, spectra, x_label, y_label, descs):
     
-    if (vk_spectrum==None) and (vk_red_fs==None):
-        
-        fig, ax = plt.subplots()
+    fig, ax = plt.subplots()
     
-        ax.plot(LES_reduced_fs, LES_spectrum)
-    
-        ax.set_xlabel(r'$f^{*}=fB/U_{ref}$')
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_ylabel(r'$f^{*}S_{uu}(f)/ \sigma_{uu}^{2}$')
-        
-        ax.minorticks_on()
-    
-    elif (vk_spectrum!=None) and (vk_red_fs==None):
-        
-        fig, ax = plt.subplots()
-    
-        ax.plot(LES_reduced_fs, LES_spectrum, label = "LES")
-        ax.plot(LES_reduced_fs, vk_spectrum, label = "von Karman")
-    
-        ax.set_xlabel(r'$f^{*}=fB/U_{ref}$')
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_ylabel(r'$f^{*}S_{uu}(f)/ \sigma_{uu}^{2}$')
+    for spectrum, desc in zip(spectra, descs):
+        ax.plot(fs, spectrum, label=desc)
         ax.legend()
-        ax.minorticks_on()
         
-    elif (vk_spectrum!=None) and (vk_red_fs!=None):
-        
-        fig, ax = plt.subplots()
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     
-        ax.plot(LES_reduced_fs, LES_spectrum, label = "LES")
-        ax.plot(vk_red_fs, vk_spectrum, label = "von Karman")
-    
-        ax.set_xlabel(r'$f^{*}=fB/U_{ref}$')
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_ylabel(r'$f^{*}S_{uu}(f)/ \sigma_{uu}^{2}$')
-        ax.legend()
-        ax.minorticks_on()
-        
+    ax.minorticks_on()     
     
     return fig
 

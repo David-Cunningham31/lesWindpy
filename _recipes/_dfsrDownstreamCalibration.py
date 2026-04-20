@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import shutil
+import matplotlib.pyplot as plt
 
 cwd = os.path.dirname(os.path.abspath(__file__))
 windlespy_path = os.path.abspath(os.path.join(cwd, "..", ".."))
@@ -44,6 +45,8 @@ burn_in_time = dfsr_les_init_dict["burn_in_time"]
 
 target_profile_df = LES._profileCalibration.get_dfsr_target_profile_df(case_path)
 
+z_array = target_profile_df["z"].to_numpy()
+
 target_profile_array = LES._profileCalibration.get_dfsr_target_profile_array(case_path)
 
 current_profile_array = LES._profileCalibration.get_current_dfsr_inlet_profile_array(case_path)
@@ -68,18 +71,58 @@ iter_status = LES._profileCalibration.dfsr_iter_status(case_path, rmse_array, rm
 
 LES._caseFiles.write_dfsr_iter_json(case_path, iter_status, "downstream")
 
+
+#%%
+
+iteration = iter_status['iteration']
+fig_folder = os.path.join(case_path,"log", "downstreamCalibration", f"iteration{iteration}","plots")
+os.makedirs(fig_folder, exist_ok=True)
+
+height_mask = (target_profile_df["z"]<=(3*building_height)).to_numpy()
+norm_heights = target_profile_df["z"].to_numpy()/building_height
+norm_heights = norm_heights[height_mask]
+
+for col_index, x_axis_desc in enumerate(target_profile_df.columns[1:]):
+    profile_list = []
+    plot_descs=[]
+    
+    if "I" in x_axis_desc:
+        downstream_profile = np.sqrt(downstream_profile_array[height_mask, col_index])/downstream_profile_array[height_mask, 0]
+        
+        target_profile = np.sqrt(target_profile_array[height_mask, col_index])/target_profile_array[height_mask, 0]
+    else:
+        downstream_profile = downstream_profile_array[height_mask, col_index]
+        
+        target_profile = target_profile_array[height_mask, col_index]
+        
+    profile_list.append(downstream_profile)
+    plot_descs.append("Downstream Profile")
+    
+    profile_list.append(target_profile)
+    plot_descs.append("Target Profile")
+    
+    profiles_array = np.stack(profile_list, axis=0)
+    
+    fig = LES._plot.plot_profile(profiles_array, norm_heights, x_axis_desc, "z/H", xlims=None, ylims=None, several=True, descs=plot_descs)
+        
+    filename = f"{x_axis_desc}_profiles.png"
+    fig.savefig(os.path.join(fig_folder, filename), dpi=300, bbox_inches="tight")
+    
+    plt.close(fig)
 #%%
 
 converged = iter_status["converged"]
 stagnated = iter_status["stagnated"]
 
-if (not converged) and (not stagnated):
+if (not converged) and (not stagnated): 
     
     new_inlet_profile_array = LES._profileCalibration.new_dfsr_profile_array(current_profile_array, target_profile_array, downstream_profile_array, relaxation_factor=0.9)
     
-    LES._caseFiles.write_new_dfsr_inlet_profile(new_inlet_profile_array, target_profile_df, case_path)
+    smoothed_new_profiles = LES._profileAnalysis.smooth_profiles(new_inlet_profile_array, z_array, 3, 3, building_height)
     
-    LES._caseFiles.write_dfsr_inlet_iter_profiles(case_path, iter_status, target_profile_df, current_profile_array, downstream_profile_array, "downstream", new_inlet_profile_array)
+    LES._caseFiles.write_new_dfsr_inlet_profile(smoothed_new_profiles, target_profile_df, case_path)
+    
+    LES._caseFiles.write_dfsr_inlet_iter_profiles(case_path, iter_status, target_profile_df, current_profile_array, downstream_profile_array, "downstream", smoothed_new_profiles)
 
 else:
     
