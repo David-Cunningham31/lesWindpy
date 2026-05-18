@@ -199,16 +199,27 @@ def extend_nheri_profiles(profile_df, z_top, fit_zmin=None, fit_zmax=None):
 
 #%%
 
-def get_tap_coord_df(excel_path):
+def get_tap_coord_df(excel_path, coordinate_units="mm"):
+    tap_coord_df = pd.read_excel(excel_path, sheet_name="Taps")
 
-     tap_coord_df = pd.read_excel(excel_path, sheet_name = "Taps")
-    
-     tap_coord_df = tap_coord_df[ ~ ((pd.isna(tap_coord_df["X"])) | (pd.isna(tap_coord_df["Y"])) | (pd.isna(tap_coord_df["Z"]))) ]
-    
-     tap_coord_df.rename(columns={"X": "x", "Y": "y", "Z": "z"}, inplace = True)
-     
-     return tap_coord_df
- 
+    tap_coord_df = tap_coord_df[
+        ~(
+            pd.isna(tap_coord_df["X"])
+            | pd.isna(tap_coord_df["Y"])
+            | pd.isna(tap_coord_df["Z"])
+        )
+    ].copy()
+
+    tap_coord_df.rename(columns={"X": "x", "Y": "y", "Z": "z"}, inplace=True)
+
+    if coordinate_units.lower() in ("mm", "millimetres", "millimeters"):
+        tap_coord_df[["x", "y", "z"]] = tap_coord_df[["x", "y", "z"]] / 1000.0
+    elif coordinate_units.lower() in ("m", "metres", "meters"):
+        pass
+    else:
+        raise ValueError("coordinate_units must be 'mm' or 'm'.")
+
+    return tap_coord_df
     
  #%%
 

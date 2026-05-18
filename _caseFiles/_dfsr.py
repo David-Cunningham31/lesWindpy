@@ -24,12 +24,24 @@ def write_dfsr_inlet_profile(target_profile_df, case_path):
     
 #%%
 
+def write_target_dfsr_inlet_profile(target_profile_df, case_path):
+        
+    output_path = os.path.join(case_path,'constant','boundaryData','windProfile','targetProfile')
+    
+    np.savetxt(
+        output_path,
+        target_profile_df.to_numpy(),
+        fmt="%.6f",
+        delimiter="\t")
+    
+#%%
+
 def write_dfsr_samp_pts(x_coord, y_coord, case_path, target_profile_df):
     
     z_coord_strs = (target_profile_df["z"].astype(str) + ")").to_numpy()
     
     probe_df = pd.DataFrame({"x":np.full((len(z_coord_strs),),f"({x_coord}"),
-                             "y":np.full((len(z_coord_strs),),f"{x_coord}"),
+                             "y":np.full((len(z_coord_strs),),f"{y_coord}"),
                              "z":z_coord_strs})
     
     output_path = os.path.join(case_path, "constant", "boundaryData","windProfile","sampledData","samplingPoints")

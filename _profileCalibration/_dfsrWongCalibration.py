@@ -56,7 +56,41 @@ def get_iter_cal_profiles(case_path, inlet_or_downstream="inlet"):
         iter_profile_dict[iter_desc]["post_corr_profile"] = post_corr_inlet_profile_df
         
     return iter_profile_dict
+   
+#%%
+
+def convert_target_profile_array_to_df(z_array, target_profile_array):
+    
+    df_dic={}
+    
+    df_dic["z"] = z_array
+    df_dic["U"] = target_profile_array[:,0]
+    df_dic["Iu"] = np.sqrt(target_profile_array[:,1])/target_profile_array[:,0]
+    df_dic["Iv"] = np.sqrt(target_profile_array[:,2])/target_profile_array[:,0]
+    df_dic["Iw"] = np.sqrt(target_profile_array[:,3])/target_profile_array[:,0]
+    df_dic["Lu"] = target_profile_array[:,4]
+    df_dic["Lv"] = target_profile_array[:,5]
+    df_dic["Lw"] = target_profile_array[:,6]
+    
+    target_profile_df = pd.DataFrame(df_dic)
+    
+    return target_profile_df
+
+#%%
+
+def convert_target_profile_df_to_array(target_profile_df):
         
+    target_profile_df["R_11"] = (target_profile_df["Iu"] * target_profile_df["U"])**2
+    target_profile_df["R_22"] = (target_profile_df["Iv"] * target_profile_df["U"])**2
+    target_profile_df["R_33"] = (target_profile_df["Iw"] * target_profile_df["U"])**2
+    
+    target_profile_df = target_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw"]]
+    
+    target_profile_array = target_profile_df.to_numpy()
+    
+    return target_profile_array
+    
+    
 #%%
 
 def get_dfsr_target_profile_df(case_path):

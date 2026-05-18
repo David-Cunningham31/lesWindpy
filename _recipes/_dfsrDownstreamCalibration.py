@@ -23,7 +23,7 @@ sys.path.remove(windlespy_path)
 #%% 
 # USER INPUTS:
 
-case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
+case_path = os.environ["CASE_DIR"]
 downstream_probes_folder = os.path.join(case_path, "postProcessing", "probes2")
 
 #%%

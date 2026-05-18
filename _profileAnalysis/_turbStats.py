@@ -13,8 +13,10 @@ import pandas as pd
 from scipy.signal import correlate
 from scipy.signal import welch
 from scipy.optimize import root_scalar
+from scipy.interpolate import PchipInterpolator
 import os
 import sys
+
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +201,10 @@ def int_time_scale(fluc_vel_array_3d, time_step):
                 i_end = len(rho) - 1
             
             # Integrate autocorrelation
-            T_int = np.trapezoid(rho[:i_end+1], tau[:i_end+1])
+            if hasattr(np, "trapezoid"):
+                T_int = np.trapezoid(rho[:i_end+1], tau[:i_end+1])
+            else:
+                T_int = np.trapz(rho[:i_end+1], tau[:i_end+1])
     
             int_time_scales[ ["u","v","w"].index(vel_comp), probe ] = T_int
         
@@ -538,6 +543,30 @@ def smooth_profiles(profiles, z_array, ti_smooth_num, l_smooth_num, structure_he
             
         return smooth_profile_array
     
+#%%
+
+def map_profile_to_inlet_z(profile_array, z_old, z_new):
+    """
+    Map a 1D target profile array onto new z locations.
+
+    Expected columns:
+    U, R_11, R_22, R_33, Lu, Lv, Lw
+    """
+    mapped_array_list = []
+
+    for col in range(np.shape(profile_array)[1]):
+        y_old = profile_array[:,col]
+
+        # Shape-preserving interpolation
+        interp_fun = PchipInterpolator(z_old, y_old, extrapolate=True)
+        y_new = interp_fun(z_new)
+
+        y_new = np.maximum(y_new, 0.0)
+
+        mapped_array_list.append(y_new)
+
+    mapped_profile_array = np.stack(mapped_array_list, axis=1)
     
+    return mapped_profile_array
     
     

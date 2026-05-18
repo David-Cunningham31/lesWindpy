@@ -18,7 +18,7 @@ import windlespy as LES
 sys.path.remove(windlespy_path)
 
 #%%
-case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
+case_path = os.environ["CASE_DIR"]
 
 variable_dict = LES._caseFiles.parse_setup_file(case_path)
 perc_err_for_convergence = 10

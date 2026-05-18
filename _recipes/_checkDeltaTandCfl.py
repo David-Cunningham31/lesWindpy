@@ -17,7 +17,7 @@ sys.path.remove(windlespy_path)
 
 #%%
 
-case_path = r"/home/people/20397873/LES/NHERI_Tall_Building/empty_domain_2"
+case_path = os.environ["CASE_DIR"]
 
 cfl_df = LES._profileAnalysis.get_cfl_df(case_path)
 
