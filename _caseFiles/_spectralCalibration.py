@@ -235,3 +235,111 @@ def write_dfsr_iter_spectra(
         os.path.join(iteration_path, "spectra_arrays.npz"),
         **savez_dict,
     )
+    
+
+#%%
+
+def write_cospectral_spectra_profile(
+    spectra_array,
+    z_array,
+    uw_stress_array,
+    filepath,
+    clip_min=1e-16,
+):
+    """
+    Write augmented coSpectralDFSR spectra profile:
+
+        nHeights nFreq
+        z uwStress Su[0:nFreq] Sv[0:nFreq] Sw[0:nFreq]
+
+    spectra_array shape: (3, nHeights, nFreq)
+    """
+    z_array = np.asarray(z_array, dtype=float).reshape(-1)
+    uw_stress_array = np.asarray(uw_stress_array, dtype=float).reshape(-1)
+    spectra_array = np.asarray(spectra_array, dtype=float)
+
+    if spectra_array.ndim != 3 or spectra_array.shape[0] != 3:
+        raise ValueError("spectra_array must have shape (3, nHeights, nFreq).")
+
+    _, n_heights, n_freq = spectra_array.shape
+
+    if len(z_array) != n_heights:
+        raise ValueError("z_array length does not match spectra height dimension.")
+    if len(uw_stress_array) != n_heights:
+        raise ValueError("uw_stress_array length does not match nHeights.")
+
+    spectra_clean = np.nan_to_num(
+        spectra_array.copy(),
+        nan=clip_min,
+        posinf=clip_min,
+        neginf=clip_min,
+    )
+    spectra_clean = np.maximum(spectra_clean, clip_min)
+
+    with open(filepath, "w") as f:
+        f.write(f"{n_heights} {n_freq}\n")
+
+        for h in range(n_heights):
+            row = np.concatenate(
+                [
+                    [z_array[h], uw_stress_array[h]],
+                    spectra_clean[0, h, :],
+                    spectra_clean[1, h, :],
+                    spectra_clean[2, h, :],
+                ]
+            )
+            f.write(" ".join(f"{val:.12e}" for val in row) + "\n")
+            
+
+#%%
+
+def write_uw_cospectrum_profile(
+    c_uw_array,
+    z_array,
+    uw_stress_array,
+    filepath,
+):
+    """
+    Write uw co-spectrum profile:
+
+        nHeights nFreq
+        z uwStress Cuw[0:nFreq]
+
+    c_uw_array shape: (nHeights, nFreq)
+    """
+    z_array = np.asarray(z_array, dtype=float).reshape(-1)
+    uw_stress_array = np.asarray(uw_stress_array, dtype=float).reshape(-1)
+    c_uw_array = np.asarray(c_uw_array, dtype=float)
+
+    if c_uw_array.ndim != 2:
+        raise ValueError("c_uw_array must have shape (nHeights, nFreq).")
+
+    n_heights, n_freq = c_uw_array.shape
+
+    if len(z_array) != n_heights:
+        raise ValueError("z_array length does not match c_uw_array.")
+    if len(uw_stress_array) != n_heights:
+        raise ValueError("uw_stress_array length does not match nHeights.")
+
+    c_clean = np.nan_to_num(
+        c_uw_array.copy(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    with open(filepath, "w") as f:
+        f.write(f"{n_heights} {n_freq}\n")
+
+        for h in range(n_heights):
+            row = np.concatenate(
+                [
+                    [z_array[h], uw_stress_array[h]],
+                    c_clean[h, :],
+                ]
+            )
+            f.write(" ".join(f"{val:.12e}" for val in row) + "\n")
+            
+
+#%%
+

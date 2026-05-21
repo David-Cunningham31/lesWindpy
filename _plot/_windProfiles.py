@@ -261,5 +261,82 @@ def plot_s_ww(LES_reduced_fs, LES_spectrum, vk_red_fs=None, vk_spectrum=None):
     return fig
         
 
+#%%
 
+def plot_cospectral_target_profiles_0_to_3H(
+    experimental_profile_df,
+    smoothed_profile_df,
+    building_height,
+    fig_dir,
+    columns=("U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"),
+):
+    """
+    Plot measured NHERI points and smoothed/extended CoSpectralDFSRTurb target
+    profiles from 0 to 3H.
+    """
+
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    os.makedirs(fig_dir, exist_ok=True)
+
+    labels = {
+        "U": "Mean velocity, U",
+        "Iu": "Longitudinal turbulence intensity, Iu",
+        "Iv": "Lateral turbulence intensity, Iv",
+        "Iw": "Vertical turbulence intensity, Iw",
+        "Lu": "Longitudinal integral length scale, Lu",
+        "Lv": "Lateral integral length scale, Lv",
+        "Lw": "Vertical integral length scale, Lw",
+        "uwStress": "Reynolds shear stress, u'w'",
+    }
+
+    z_max = 3.0 * float(building_height)
+
+    for col in columns:
+        if col not in smoothed_profile_df.columns:
+            print(f"Skipping {col}: not found in smoothed profile.")
+            continue
+
+        fig, ax = plt.subplots(figsize=(5.5, 6.0))
+
+        z_s = smoothed_profile_df["z"].to_numpy(dtype=float)
+        y_s = smoothed_profile_df[col].to_numpy(dtype=float)
+        m_s = np.isfinite(z_s) & np.isfinite(y_s) & (z_s <= z_max)
+
+        ax.plot(
+            y_s[m_s],
+            z_s[m_s] / building_height,
+            linewidth=2.0,
+            label="Smoothed/extended target",
+        )
+
+        if col in experimental_profile_df.columns:
+            z_e = experimental_profile_df["z"].to_numpy(dtype=float)
+            y_e = experimental_profile_df[col].to_numpy(dtype=float)
+            m_e = np.isfinite(z_e) & np.isfinite(y_e) & (z_e <= z_max)
+
+            ax.scatter(
+                y_e[m_e],
+                z_e[m_e] / building_height,
+                s=28,
+                marker="o",
+                label="Experimental",
+                zorder=3,
+            )
+
+        ax.set_ylim(0.0, 3.0)
+        ax.set_ylabel(r"$z/H$")
+        ax.set_xlabel(labels.get(col, col))
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_title(labels.get(col, col))
+
+        fig.tight_layout()
+        fig.savefig(
+            os.path.join(fig_dir, f"cospectral_target_profile_{col}.png"),
+            dpi=300,
+        )
+        plt.close(fig)
     

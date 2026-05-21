@@ -231,4 +231,203 @@ def write_surf_pressure_probe_files(case_path, tap_coord_df, patch_name):
         surf_tap_df = tap_coord_df[tap_coord_df["Surface"]==surface_num]
         surf_str = "Surface"+str(surface_num)[0]
         LES._caseFiles.write_surf_presure_probes(field, surf_tap_df, patch_name, case_path, f"probes{surf_str}")
-    
+        
+#%%
+
+def calc_nheri_reynolds_stresses(vel_array_3d, ddof=0):
+    """
+    Calculate Reynolds stress profiles from NHERI velocity time series.
+
+    Parameters
+    ----------
+    vel_array_3d : ndarray
+        Velocity array with shape (3, nTime, nHeights), as returned by
+        get_nheri_vel_time_series().
+    ddof : int
+        Delta degrees of freedom for covariance averaging.
+        ddof=0 gives population mean, ddof=1 gives sample covariance.
+
+    Returns
+    -------
+    reynolds_stress_df : pandas.DataFrame
+        Columns:
+            uu, vv, ww, uv, uw, vw
+    """
+
+    vel = np.asarray(vel_array_3d, dtype=float)
+
+    if vel.ndim != 3 or vel.shape[0] != 3:
+        raise ValueError(
+            "vel_array_3d must have shape (3, nTime, nHeights)."
+        )
+
+    mean_vel = np.nanmean(vel, axis=1, keepdims=True)
+    fluc = vel - mean_vel
+
+    u = fluc[0, :, :]
+    v = fluc[1, :, :]
+    w = fluc[2, :, :]
+
+    if ddof == 0:
+        norm = np.sum(np.isfinite(u), axis=0)
+    else:
+        norm = np.maximum(np.sum(np.isfinite(u), axis=0) - ddof, 1)
+
+    def cov(a, b):
+        good = np.isfinite(a) & np.isfinite(b)
+        num = np.nansum(np.where(good, a * b, 0.0), axis=0)
+        den = np.maximum(np.sum(good, axis=0) - ddof, 1)
+        return num / den
+
+    reynolds_stress_df = pd.DataFrame(
+        {
+            "uu": cov(u, u),
+            "vv": cov(v, v),
+            "ww": cov(w, w),
+            "uv": cov(u, v),
+            "uw": cov(u, w),
+            "vw": cov(v, w),
+        }
+    )
+
+    return reynolds_stress_df
+
+#%%
+
+def add_nheri_reynolds_stresses(profile_df, vel_array_3d, ddof=0):
+    """
+    Add Reynolds stress columns to an NHERI profile dataframe.
+
+    Adds:
+        uu, vv, ww, uv, uw, vw, uwStress
+
+    uwStress is duplicated from uw because CoSpectralDFSRTurb uses that name.
+    """
+
+    profile_df = profile_df.copy()
+    rs_df = calc_nheri_reynolds_stresses(vel_array_3d, ddof=ddof)
+
+    if len(rs_df) != len(profile_df):
+        raise ValueError(
+            f"Reynolds stress length ({len(rs_df)}) does not match "
+            f"profile length ({len(profile_df)})."
+        )
+
+    for col in rs_df.columns:
+        profile_df[col] = rs_df[col].to_numpy(dtype=float)
+
+    profile_df["uwStress"] = profile_df["uw"]
+
+    return profile_df
+
+#%%
+
+def extend_nheri_profiles_with_reynolds_stress(
+    profile_df,
+    z_top,
+    fit_zmin=None,
+    fit_zmax=None,
+    uw_extension="constant_correlation",
+):
+    """
+    Extend NHERI mean/TI/length-scale profiles and preserve Reynolds stresses.
+
+    This wraps extend_nheri_profiles(), then fills uv/uw/vw above the measured
+    region.
+
+    uw_extension options
+    --------------------
+    "constant_correlation":
+        Preserve the top measured correlation coefficient:
+            rho_uw = uw / sqrt(uu * ww)
+        and apply it to the extended uu and ww.
+
+    "constant_stress":
+        Hold uw, uv, vw fixed at their top measured values.
+
+    Notes
+    -----
+    extend_nheri_profiles() currently extends U, Iu, Iv, Iw, Lu, Lv, Lw.
+    Since uu/vv/ww are implied by (I * U)^2, this function recomputes
+    uu/vv/ww after extension.
+    """
+
+    input_df = profile_df.copy()
+    extended = extend_nheri_profiles(
+        input_df,
+        z_top=z_top,
+        fit_zmin=fit_zmin,
+        fit_zmax=fit_zmax,
+    )
+
+    # Recompute normal stresses from extended U and turbulence intensities.
+    extended["uu"] = (extended["Iu"] * extended["U"]) ** 2
+    extended["vv"] = (extended["Iv"] * extended["U"]) ** 2
+    extended["ww"] = (extended["Iw"] * extended["U"]) ** 2
+
+    measured = input_df.copy()
+    top = measured.loc[measured["z"].idxmax()]
+
+    has_cross = all(col in measured.columns for col in ["uv", "uw", "vw"])
+
+    if not has_cross:
+        extended["uv"] = np.nan
+        extended["uw"] = np.nan
+        extended["vw"] = np.nan
+        extended["uwStress"] = np.nan
+        return extended
+
+    z_m = float(top["z"])
+    measured_mask = extended["z"] <= z_m + 1e-12
+    extra_mask = ~measured_mask
+
+    # Preserve measured stresses over the measured region by interpolation,
+    # because extend_nheri_profiles concatenates the original measured rows.
+    for col in ["uv", "uw", "vw"]:
+        extended.loc[measured_mask, col] = np.interp(
+            extended.loc[measured_mask, "z"].to_numpy(dtype=float),
+            measured["z"].to_numpy(dtype=float),
+            measured[col].to_numpy(dtype=float),
+        )
+
+    if uw_extension == "constant_stress":
+        for col in ["uv", "uw", "vw"]:
+            extended.loc[extra_mask, col] = float(top[col])
+
+    elif uw_extension == "constant_correlation":
+        eps = 1e-30
+
+        rho_uv_top = float(top["uv"]) / np.sqrt(
+            max(float(top["uu"]) * float(top["vv"]), eps)
+        )
+        rho_uw_top = float(top["uw"]) / np.sqrt(
+            max(float(top["uu"]) * float(top["ww"]), eps)
+        )
+        rho_vw_top = float(top["vw"]) / np.sqrt(
+            max(float(top["vv"]) * float(top["ww"]), eps)
+        )
+
+        extended.loc[extra_mask, "uv"] = rho_uv_top * np.sqrt(
+            extended.loc[extra_mask, "uu"] *
+            extended.loc[extra_mask, "vv"]
+        )
+        extended.loc[extra_mask, "uw"] = rho_uw_top * np.sqrt(
+            extended.loc[extra_mask, "uu"] *
+            extended.loc[extra_mask, "ww"]
+        )
+        extended.loc[extra_mask, "vw"] = rho_vw_top * np.sqrt(
+            extended.loc[extra_mask, "vv"] *
+            extended.loc[extra_mask, "ww"]
+        )
+
+    else:
+        raise ValueError(
+            "uw_extension must be 'constant_correlation' or 'constant_stress'."
+        )
+
+    extended["uwStress"] = extended["uw"]
+
+    return extended
+
+#%%
+

@@ -1074,7 +1074,8 @@ def integrate_spectrum_variance(freq_array, spectrum):
     S = np.asarray(spectrum, dtype=float)
     if hasattr(np, "trapezoid"):
         return np.trapezoid(S, f)
-    return np.trapz(S, f)
+    else:
+        return np.trapz(S, f)
 
 #%%
 def get_resolved_frequency_limits(time_steps, mesh_cutoff_freq=None):
@@ -1606,3 +1607,613 @@ def make_resolved_consistent_target_spectra_profile_dfsr(
 
     summary_df = pd.DataFrame(rows)
     return corrected_dfsr, uncorrected_dfsr, corrected_diagnostics, uncorrected_diagnostics, summary_df
+
+#%%
+
+def get_kaimal_uw_cospectrum_shape(
+    freq_array,
+    z_array,
+    U_array,
+    floor=1e-30,
+):
+    """
+    Return a positive Kaimal uw co-spectrum magnitude shape phi_uw(z,f).
+
+    Kaimal neutral form:
+
+        - n C_uw(n) / u_*^2 = 14 eta / (1 + 9.6 eta)^2.4
+
+    where eta = n z / U.
+
+    This function returns only the positive shape. The sign and final area
+    normalisation are applied later.
+    """
+    f = np.asarray(freq_array, dtype=float).reshape(-1)
+    z = np.asarray(z_array, dtype=float).reshape(-1)
+    U = np.asarray(U_array, dtype=float).reshape(-1)
+
+    if np.any(f <= 0.0):
+        raise ValueError("freq_array must be strictly positive.")
+    if len(z) != len(U):
+        raise ValueError("z_array and U_array must have the same length.")
+
+    n_heights = len(z)
+    n_freq = len(f)
+    phi = np.zeros((n_heights, n_freq), dtype=float)
+
+    for h in range(n_heights):
+        Uh = max(float(U[h]), floor)
+        zh = max(float(z[h]), floor)
+
+        eta = f * zh / Uh
+
+        # Since -n Cuw/u_*^2 = F(eta),
+        # |Cuw| shape is F(eta)/n.
+        F_eta = 14.0 * eta / np.power(1.0 + 9.6 * eta, 2.4)
+        phi[h, :] = F_eta / np.maximum(f, floor)
+
+    return np.maximum(phi, floor)
+
+#%%
+
+def normalise_uw_cospectrum_to_stress(
+    freq_array,
+    shape_array,
+    uw_stress_array,
+    enforce_negative=True,
+    floor=1e-30,
+):
+    """
+    Scale a positive co-spectral shape so that:
+
+        integral Cuw(f,z) df = uw_stress(z)
+
+    shape_array has shape (nHeights, nFreq).
+    uw_stress_array has shape (nHeights,).
+    """
+    f = np.asarray(freq_array, dtype=float).reshape(-1)
+    shape = np.asarray(shape_array, dtype=float)
+    uw = np.asarray(uw_stress_array, dtype=float).reshape(-1)
+
+    if shape.ndim != 2:
+        raise ValueError("shape_array must have shape (nHeights, nFreq).")
+    if shape.shape[0] != len(uw):
+        raise ValueError("uw_stress_array length must match nHeights.")
+    if shape.shape[1] != len(f):
+        raise ValueError("shape_array frequency dimension must match freq_array.")
+
+    out = np.zeros_like(shape)
+
+    for h in range(shape.shape[0]):
+        area = np.trapz(np.maximum(shape[h, :], floor), f)
+        if not np.isfinite(area) or area <= 0.0:
+            out[h, :] = 0.0
+            continue
+
+        target_area = float(uw[h])
+
+        if enforce_negative:
+            target_area = -abs(target_area)
+
+        out[h, :] = target_area * shape[h, :] / area
+
+    return out
+
+#%%
+
+def estimate_uw_stress_profile(
+    target_profile_array,
+    target_profile_df=None,
+    uw_column_candidates=("uw", "uwStress", "u'w'", "uPrimeWPrime", "Ruw"),
+    fallback_rho=-0.30,
+):
+    """
+    Get uw stress profile from a dataframe if available; otherwise use:
+
+        uw = rho_uw * sigma_u * sigma_w
+
+    target_profile_array convention used by DFSR:
+        column 0: U
+        columns 1:4: variances uu, vv, ww
+    """
+    n_heights = target_profile_array.shape[0]
+
+    if target_profile_df is not None:
+        for col in uw_column_candidates:
+            if col in target_profile_df.columns:
+                uw = target_profile_df[col].to_numpy(dtype=float)
+                if len(uw) == n_heights:
+                    return uw
+
+    sigma_u = np.sqrt(np.maximum(target_profile_array[:, 1], 0.0))
+    sigma_w = np.sqrt(np.maximum(target_profile_array[:, 3], 0.0))
+
+    return fallback_rho * sigma_u * sigma_w
+
+#%%
+
+def clip_uw_cospectrum_realizable(
+    c_uw_array,
+    spectra_array,
+    rho_max=0.95,
+):
+    """
+    Enforce local one-point CPSD realizability:
+
+        |Cuw(z,f)| <= rho_max * sqrt(Suu(z,f) Sww(z,f))
+
+    spectra_array shape: (3, nHeights, nFreq)
+    c_uw_array shape:   (nHeights, nFreq)
+    """
+    C = np.asarray(c_uw_array, dtype=float).copy()
+    S = np.asarray(spectra_array, dtype=float)
+
+    if S.shape[0] != 3:
+        raise ValueError("spectra_array must have shape (3, nHeights, nFreq).")
+    if C.shape != S[0].shape:
+        raise ValueError("c_uw_array must have shape (nHeights, nFreq).")
+
+    bound = rho_max * np.sqrt(
+        np.maximum(S[0, :, :], 0.0) *
+        np.maximum(S[2, :, :], 0.0)
+    )
+
+    C_clipped = np.clip(C, -bound, bound)
+
+    diagnostics = {
+        "n_clipped": int(np.count_nonzero(C_clipped != C)),
+        "max_abs_rho_before": float(
+            np.nanmax(
+                np.abs(C) / np.maximum(
+                    np.sqrt(np.maximum(S[0, :, :], 0.0) * np.maximum(S[2, :, :], 0.0)),
+                    1e-300,
+                )
+            )
+        ),
+        "max_abs_rho_after": float(
+            np.nanmax(
+                np.abs(C_clipped) / np.maximum(
+                    np.sqrt(np.maximum(S[0, :, :], 0.0) * np.maximum(S[2, :, :], 0.0)),
+                    1e-300,
+                )
+            )
+        ),
+    }
+
+    return C_clipped, diagnostics
+
+#%%
+
+def make_target_cospectral_dfsr_profiles(
+    target_profile_array,
+    z_array,
+    freq_array,
+    spectra_array,
+    uw_stress_array=None,
+    target_profile_df=None,
+    fallback_rho=-0.30,
+    rho_max=0.95,
+    enforce_negative=True,
+    floor=1e-30,
+    resolved_fmin_array=None,
+    resolved_fmax_array=None,
+):
+    """
+    Build target uwStress(z) and Cuw(z,f) for CoSpectralDFSRTurb.
+    """
+    z_array = np.asarray(z_array, dtype=float).reshape(-1)
+    freq_array = np.asarray(freq_array, dtype=float).reshape(-1)
+    target_profile_array = np.asarray(target_profile_array, dtype=float)
+    spectra_array = np.asarray(spectra_array, dtype=float)
+
+    U = target_profile_array[:, 0]
+
+    if uw_stress_array is not None:
+        uw_stress = np.asarray(uw_stress_array, dtype=float).reshape(-1)
+
+    if len(uw_stress) != target_profile_array.shape[0]:
+        raise ValueError(
+            "uw_stress_array length must match the number of target profile heights."
+        )
+    else:
+        uw_stress = estimate_uw_stress_profile(
+            target_profile_array=target_profile_array,
+            target_profile_df=target_profile_df,
+            fallback_rho=fallback_rho,
+        )
+
+    shape = get_kaimal_uw_cospectrum_shape(
+        freq_array=freq_array,
+        z_array=z_array,
+        U_array=U,
+        floor=floor,
+    )
+
+    if resolved_fmin_array is not None and resolved_fmax_array is not None:
+        c_uw = normalise_uw_cospectrum_to_resolved_stress(
+            freq_array=freq_array,
+            shape_array=shape,
+            uw_stress_array=uw_stress,
+            resolved_fmin_array=resolved_fmin_array,
+            resolved_fmax_array=resolved_fmax_array,
+            enforce_negative=enforce_negative,
+            floor=floor,
+        )
+    else:
+        c_uw = normalise_uw_cospectrum_to_stress(
+            freq_array=freq_array,
+            shape_array=shape,
+            uw_stress_array=uw_stress,
+            enforce_negative=enforce_negative,
+            floor=floor,
+        )
+
+    c_uw_clipped, diagnostics = clip_uw_cospectrum_realizable(
+        c_uw_array=c_uw,
+        spectra_array=spectra_array,
+        rho_max=rho_max,
+    )
+
+    if hasattr(np, "trapezoid"):
+        diagnostics["uw_area_before_clip"] = np.trapezoid(c_uw, freq_array, axis=1)
+        diagnostics["uw_area_after_clip"] = np.trapezoid(c_uw_clipped, freq_array, axis=1)
+    else:
+        diagnostics["uw_area_before_clip"] = np.trapz(c_uw, freq_array, axis=1)
+        diagnostics["uw_area_after_clip"] = np.trapz(c_uw_clipped, freq_array, axis=1)
+    diagnostics["uw_stress_target"] = uw_stress
+
+    return uw_stress, c_uw_clipped, diagnostics
+
+#%%
+
+def normalise_uw_cospectrum_to_resolved_stress(
+    freq_array,
+    shape_array,
+    uw_stress_array,
+    resolved_fmin_array,
+    resolved_fmax_array,
+    enforce_negative=True,
+    floor=1e-30,
+):
+    """
+    Scale positive Cuw shape so that the integral over the resolved frequency
+    band equals uw_stress(z).
+
+        integral_{fmin(z)}^{fmax(z)} Cuw(z,f) df = uwStress(z)
+
+    shape_array has shape (nHeights, nFreq).
+    """
+    f = np.asarray(freq_array, dtype=float).reshape(-1)
+    shape = np.asarray(shape_array, dtype=float)
+    uw = np.asarray(uw_stress_array, dtype=float).reshape(-1)
+    fmin = np.asarray(resolved_fmin_array, dtype=float).reshape(-1)
+    fmax = np.asarray(resolved_fmax_array, dtype=float).reshape(-1)
+
+    if shape.shape != (len(uw), len(f)):
+        raise ValueError("shape_array must have shape (nHeights, nFreq).")
+
+    out = np.zeros_like(shape)
+
+    for h in range(shape.shape[0]):
+        mask = (f >= fmin[h]) & (f <= fmax[h])
+        if np.count_nonzero(mask) < 2:
+            mask = np.ones_like(f, dtype=bool)
+
+        if hasattr(np, "trapezoid"):
+            area = np.trapezoid(np.maximum(shape[h, mask], floor), f[mask])
+        else:
+            area = np.trapz(np.maximum(shape[h, mask], floor), f[mask])
+
+        if not np.isfinite(area) or area <= 0.0:
+            out[h, :] = 0.0
+            continue
+
+        target_area = float(uw[h])
+        if enforce_negative:
+            target_area = -abs(target_area)
+
+        out[h, :] = target_area * shape[h, :] / area
+
+    return out
+
+
+#%%
+
+def make_cospectral_target_profile_from_nheri(
+    approach_flow_data,
+    z_inlet,
+    z_top,
+    structure_height,
+    smoothing=True,
+    ti_smooth_num=5,
+    l_smooth_num=7,
+    uw_extension="constant_correlation",
+):
+    """
+    Build target profile data for CoSpectralDFSRTurb from NHERI approach-flow data.
+
+    The final profile contains exactly one Reynolds shear-stress column:
+        uwStress
+
+    The returned array has columns:
+        U, uu, vv, ww, Lu, Lv, Lw, uwStress
+    """
+
+    z_inlet = np.asarray(z_inlet, dtype=float).reshape(-1)
+
+    # ------------------------------------------------------------------
+    # 1. Load measured NHERI velocity/profile data
+    # ------------------------------------------------------------------
+    vel_array_3d = LES._windTunnel.get_nheri_vel_time_series(approach_flow_data)
+
+    measured_df = LES._windTunnel.get_nheri_profile_df(approach_flow_data)
+
+    int_length_scales = LES._windTunnel.calc_nheri_int_length_scales(vel_array_3d)
+
+    measured_df = LES._windTunnel.add_nheri_int_length_scales(
+            measured_df,
+            int_length_scales,
+        )
+    
+    measured_df = LES._windTunnel.add_nheri_reynolds_stresses(
+        measured_df,
+        vel_array_3d,
+        ddof=0,
+    )
+    
+    experimental_profile_df = measured_df.copy()
+    
+    extended_df = LES._windTunnel.extend_nheri_profiles_with_reynolds_stress(
+        measured_df,
+        z_top,
+        fit_zmin=None,
+        fit_zmax=None,
+        uw_extension=uw_extension,
+    )
+    
+    if "uwStress" not in extended_df.columns and "uw" in extended_df.columns:
+        extended_df["uwStress"] = extended_df["uw"].to_numpy(dtype=float)
+    
+    if "uw" in extended_df.columns:
+        extended_df = extended_df.drop(columns=["uw"])
+    
+    if smoothing:
+        smoothed_df = smooth_cospectral_target_profile_df(
+        extended_df,
+        ti_smooth_num=ti_smooth_num,
+        l_smooth_num=l_smooth_num,
+    )
+    else:
+        smoothed_df = extended_df.copy()
+
+    # ------------------------------------------------------------------
+    # 4. Map to inlet cell-centre heights
+    # ------------------------------------------------------------------
+    mapped_df = map_cospectral_target_profile_to_z(
+        smoothed_df,
+        z_inlet,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Build direct coSpectral profile array
+    # ------------------------------------------------------------------
+    cospectral_target_profile_array = cospectral_target_profile_df_to_array(
+        mapped_df
+    )
+
+    return (
+        experimental_profile_df,
+        extended_df,
+        smoothed_df,
+        mapped_df,
+        cospectral_target_profile_array,
+    )
+
+#%%
+
+def smooth_cospectral_target_profile_df(
+    profile_df,
+    window_length=7,
+    polyorder=2,
+    columns=("U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"),
+):
+    """
+    Smooth all CoSpectralDFSRTurb target-profile quantities consistently.
+
+    For positive quantities, smoothing is done in linear space and clipped
+    positive afterward.
+
+    For uwStress, smoothing is done in linear space and the dominant sign is
+    preserved.
+    """
+
+    import numpy as np
+    from scipy.signal import savgol_filter
+
+    df = profile_df.copy()
+
+    if "uw" in df.columns:
+        if "uwStress" not in df.columns:
+            df["uwStress"] = df["uw"]
+        df = df.drop(columns=["uw"])
+
+    z = df["z"].to_numpy(dtype=float)
+
+    def _smooth_1d(y, preserve_sign=False, positive=False):
+        y = np.asarray(y, dtype=float)
+        valid = np.isfinite(z) & np.isfinite(y)
+
+        if np.count_nonzero(valid) < 3:
+            return y
+
+        y_fill = np.interp(z, z[valid], y[valid])
+
+        n = len(y_fill)
+        win = int(window_length)
+
+        if win > n:
+            win = n if n % 2 == 1 else n - 1
+        if win % 2 == 0:
+            win -= 1
+        if win <= polyorder or win < 3:
+            y_smooth = y_fill
+        else:
+            y_smooth = savgol_filter(
+                y_fill,
+                window_length=win,
+                polyorder=polyorder,
+                mode="interp",
+            )
+
+        if positive:
+            y_smooth = np.maximum(y_smooth, 1e-30)
+
+        if preserve_sign:
+            dominant_sign = np.sign(np.nanmedian(y_fill[valid]))
+            if dominant_sign != 0.0:
+                y_smooth = dominant_sign * np.abs(y_smooth)
+
+        return y_smooth
+
+    positive_cols = {"U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"}
+
+    for col in columns:
+        if col not in df.columns:
+            continue
+
+        if col == "uwStress":
+            df[col] = _smooth_1d(
+                df[col].to_numpy(dtype=float),
+                preserve_sign=True,
+                positive=False,
+            )
+        else:
+            df[col] = _smooth_1d(
+                df[col].to_numpy(dtype=float),
+                preserve_sign=False,
+                positive=(col in positive_cols),
+            )
+
+    return df
+
+#%%
+
+def map_cospectral_target_profile_to_z(
+    profile_df,
+    z_target,
+    columns=("U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"),
+):
+    """
+    Map a CoSpectralDFSRTurb target profile dataframe to inlet cell-centre heights.
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    z_source = profile_df["z"].to_numpy(dtype=float)
+    z_target = np.asarray(z_target, dtype=float).reshape(-1)
+
+    mapped = {"z": z_target}
+
+    for col in columns:
+        if col not in profile_df.columns:
+            raise ValueError(f"Required coSpectral target column missing: {col}")
+
+        mapped[col] = np.interp(
+            z_target,
+            z_source,
+            profile_df[col].to_numpy(dtype=float),
+        )
+
+    return pd.DataFrame(mapped)
+
+#%%
+
+def cospectral_target_profile_df_to_array(profile_df):
+    """
+    Convert coSpectralDFSR target profile dataframe to array.
+
+    Output columns:
+        U, uu, vv, ww, Lu, Lv, Lw, uwStress
+
+    where:
+        uu = (Iu U)^2
+        vv = (Iv U)^2
+        ww = (Iw U)^2
+    """
+
+    import numpy as np
+
+    required = ["U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"]
+
+    missing = [c for c in required if c not in profile_df.columns]
+    if missing:
+        raise ValueError(f"Missing required coSpectral target columns: {missing}")
+
+    U = profile_df["U"].to_numpy(dtype=float)
+    Iu = profile_df["Iu"].to_numpy(dtype=float)
+    Iv = profile_df["Iv"].to_numpy(dtype=float)
+    Iw = profile_df["Iw"].to_numpy(dtype=float)
+
+    uu = (Iu * U) ** 2
+    vv = (Iv * U) ** 2
+    ww = (Iw * U) ** 2
+
+    Lu = profile_df["Lu"].to_numpy(dtype=float)
+    Lv = profile_df["Lv"].to_numpy(dtype=float)
+    Lw = profile_df["Lw"].to_numpy(dtype=float)
+    uw = profile_df["uwStress"].to_numpy(dtype=float)
+
+    return np.column_stack([U, uu, vv, ww, Lu, Lv, Lw, uw])
+
+#%%
+
+def smooth_cospectral_target_profile_df(
+    profile_df,
+    ti_smooth_num=5,
+    l_smooth_num=7,
+    columns=("U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"),
+):
+    """
+    Smooth CoSpectralDFSRTurb target profiles using the same moving-average
+    kernel convention as LES._profileAnalysis.smooth_profiles(), but without
+    plotting side effects.
+
+    U, Iu, Iv, Iw, uwStress use ti_smooth_num.
+    Lu, Lv, Lw use l_smooth_num.
+    """
+
+    df = profile_df.copy()
+
+    if "uwStress" not in df.columns and "uw" in df.columns:
+        df["uwStress"] = df["uw"].to_numpy(dtype=float)
+
+    if "uw" in df.columns:
+        df = df.drop(columns=["uw"])
+
+    out = {"z": df["z"].to_numpy(dtype=float)}
+
+    for col in columns:
+        if col not in df.columns:
+            raise ValueError(f"Required coSpectral target column missing: {col}")
+
+        y = df[col].to_numpy(dtype=float)
+
+        finite = np.isfinite(y)
+        if np.count_nonzero(finite) < 2:
+            raise ValueError(
+                f"Column {col} has fewer than two finite values before smoothing."
+            )
+
+        if not np.all(finite):
+            z = df["z"].to_numpy(dtype=float)
+            y = np.interp(z, z[finite], y[finite])
+
+        n_smooth = l_smooth_num if col in ("Lu", "Lv", "Lw") else ti_smooth_num
+
+        out[col] = LES._profileAnalysis.wong_kernel_smooth(
+            y,
+            n=n_smooth,
+        )
+
+    return pd.DataFrame(out)

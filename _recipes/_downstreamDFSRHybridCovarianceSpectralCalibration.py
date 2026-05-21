@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Standalone downstream DFSR hybrid spectral/autocorrelation calibration recipe.
+Standalone downstream DFSR hybrid spectral/autocorrelation + uw co-spectral/cross-covariance calibration recipe.
 
 This script combines the two testing branches we have been developing:
 
 1. Spectral calibration supplies the baseline updated spectrum using the fitted
    downstream multitaper/spline spectrum and the Wong-style residual update.
-2. Autocorrelation calibration supplies the low-frequency branch. That full
-   low-frequency branch is vertically shifted with a single multiplier so that
-   it matches the first spectral-calibration knot.
+2. Autocorrelation calibration now uses the full raw updated autocorrelation
+   function to construct the low-frequency branch. That branch is vertically
+   shifted with a single multiplier so that it matches the first
+   spectral-calibration knot.
 3. Eight low-frequency autocorrelation knots are then combined with the normal
    spectral-calibration knots, and one log-log PCHIP is fitted through the
    merged knot set.
@@ -17,7 +18,9 @@ This script combines the two testing branches we have been developing:
 
 The script is intentionally self-contained and does not require editing
 windLespy. It reuses windLespy for case IO, profile processing, downstream
-spectral estimation, and writing DFSR files.
+spectral estimation, and writing DFSR files. This version additionally calibrates
+the u-w co-spectrum using downstream co-spectra at higher frequencies and
+downstream cross-covariance at lower frequencies.
 """
 
 import json
@@ -27,6 +30,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.interpolate import PchipInterpolator, interp1d
+from scipy.signal.windows import dpss
+from scipy.fft import rfft, rfftfreq
 
 try:
     from scipy.optimize import curve_fit
@@ -81,10 +86,10 @@ downstream_probes_folder = os.path.join(case_path, "postProcessing", "probes2")
 WRITE_RESULTS = True
 WRITE_ITER_SPECTRA = True
 
-MEAN_PROFILE_RELAXATION_FACTOR = 0.9
-SPECTRAL_RELAXATION_FACTOR = 0.9
-AUTOCORR_RELAXATION_FACTOR = 0.9
-VARIANCE_RELAXATION_FACTOR = 0.9
+MEAN_PROFILE_RELAXATION_FACTOR = 0.5
+SPECTRAL_RELAXATION_FACTOR = 0.35
+AUTOCORR_RELAXATION_FACTOR = 0.35
+VARIANCE_RELAXATION_FACTOR = 0.35
 
 # Downstream variance used in the resolved-band Wong variance update.
 # "spectra_smoothed" is most consistent with the spectral update; "time_series"
@@ -140,7 +145,7 @@ AUTOCORR_ZERO_TOL = EXP_ZERO_TOL
 AUTOCORR_ZERO_PERSISTENCE_POINTS = 3
 AUTOCORR_ZERO_LOOKAHEAD_POINTS = 8
 
-APPLY_AUTOCOVARIANCE_TAPER = True
+APPLY_AUTOCOVARIANCE_TAPER = True  # still taper the raw autocovariance tail before the cosine transform
 TAPER_START_FRACTION = 0.75
 CLIP_NEGATIVE_SPECTRUM_TO_FLOOR = True
 
@@ -171,6 +176,70 @@ HYBRID_ADD_ENDPOINT_ANCHORS = True
 # locally to the spectral branch instead of globally re-scaling the full result.
 RENORMALISE_SPECTRAL_BASELINE_TO_UPDATED_VARIANCE = False
 RENORMALISE_HYBRID_TO_UPDATED_VARIANCE = False
+
+
+# u-w co-spectrum / cross-covariance calibration.
+# This branch mirrors the auto-spectrum hybrid method but uses:
+#   high f: downstream Cuw(f) co-spectral residual update
+#   low f : downstream Ruw(tau) cross-covariance update
+# The final area (integrated uw stress) is diagnostic by default, not forced,
+# matching the auto-spectral calibration philosophy above.
+INCLUDE_UW_COSPECTRAL_CALIBRATION = True
+UW_COSPECTRAL_RELAXATION_FACTOR = 0.35
+UW_CROSSCOV_RELAXATION_FACTOR = 0.35
+UW_STRESS_RELAXATION_FACTOR = 0.35
+RENORMALISE_UW_COSPECTRUM_TO_UPDATED_STRESS = False
+
+# If no uwStress column is found in the target/profile/spectraProfile files,
+# fall back to rho_uw * sigma_u * sigma_w. Use a negative rho for neutral ABL shear.
+UW_FALLBACK_RHO = -0.30
+UW_TARGET_STRESS_COLUMN_CANDIDATES = (
+    "uwStress", "UWStress", "Ruw", "R13", "uw", "u'w'", "u_w", "cov_uw"
+)
+
+# Kaimal is used only to initialise the target/inlet Cuw shape when a calibrated
+# Cuw profile is not already present. The discrete shape is rescaled so its area
+# equals the chosen uwStress profile.
+UW_USE_KAIMAL_IF_PROFILE_COSPECTRUM_MISSING = True
+UW_ENFORCE_NEGATIVE_COSPECTRUM = True
+UW_MAGNITUDE_FLOOR = 1e-20
+UW_RHO_MAX = 0.95
+
+# Smoothing/binning for measured downstream Cuw. These default to the auto-PSD
+# settings, but are separate because co-spectra are much noisier.
+UW_PSD_FIT_MIN = PSD_FIT_MIN
+UW_PSD_FIT_MAX = PSD_FIT_MAX
+UW_MIN_POINTS_PER_BIN = PSD_MIN_POINTS_PER_BIN
+UW_BAND_CONFIG = PSD_BAND_CONFIG
+UW_LOW_PLATEAU_BAND = PSD_LOW_PLATEAU_BAND
+UW_LEFT_MODE = PSD_LEFT_MODE
+UW_RIGHT_MODE = PSD_RIGHT_MODE
+UW_RIGHT_SLOPE_CLIP = PSD_RIGHT_SLOPE_CLIP
+UW_SMOOTH_KNOTS = PSD_SMOOTH_KNOTS
+UW_KNOT_SMOOTH_KERNEL = PSD_KNOT_SMOOTH_KERNEL
+UW_HEIGHT_KERNEL = PSD_HEIGHT_KERNEL
+
+# Join-matched low-frequency cross-covariance branch.
+UW_HYBRID_LOW_FREQ_N_KNOTS = HYBRID_LOW_FREQ_N_KNOTS
+UW_HYBRID_LOW_FREQ_MAX_FRACTION_OF_FIRST_KNOT = HYBRID_LOW_FREQ_MAX_FRACTION_OF_FIRST_KNOT
+UW_HYBRID_LOW_FREQ_RATIO_MIN = HYBRID_LOW_FREQ_RATIO_MIN
+UW_HYBRID_LOW_FREQ_RATIO_MAX = HYBRID_LOW_FREQ_RATIO_MAX
+UW_HYBRID_JOIN_SCALE_MIN = HYBRID_JOIN_SCALE_MIN
+UW_HYBRID_JOIN_SCALE_MAX = HYBRID_JOIN_SCALE_MAX
+UW_HYBRID_FIRST_KNOT_FALLBACK = HYBRID_FIRST_KNOT_FALLBACK
+UW_HYBRID_ADD_ENDPOINT_ANCHORS = HYBRID_ADD_ENDPOINT_ANCHORS
+
+# Write formats for the modified DFSR utility. The augmented spectraProfile is:
+#   nHeights nFreq
+#   z uwStress Su[0:nFreq] Sv[0:nFreq] Sw[0:nFreq]
+# and the separate uwCoSpectrumProfile is:
+#   nHeights nFreq
+#   z uwStress Cuw[0:nFreq]
+WRITE_AUGMENTED_SPECTRA_PROFILE_WITH_UWSTRESS = True
+WRITE_UW_COSPECTRA_PROFILE = True
+WRITE_LEGACY_3COMP_SPECTRA_BACKUP = True
+SPECTRA_PROFILE_UW_FILENAME = "uwCoSpectrumProfile"
+
 
 # Tail treatment.
 APPLY_POWER_LAW_TAIL = True
@@ -235,7 +304,7 @@ def renormalise_spectra_to_variance(freq_array, spectra_array, target_variance, 
     return np.maximum(out, floor)
 
 
-def wong_update_variance(inlet_sigma2, target_sigma2, downstream_sigma2, relaxation_factor=0.9, floor=1e-16):
+def wong_update_variance(inlet_sigma2, target_sigma2, downstream_sigma2, relaxation_factor=0.35, floor=1e-16):
     inlet = np.maximum(np.asarray(inlet_sigma2, dtype=float), floor)
     target = np.maximum(np.asarray(target_sigma2, dtype=float), floor)
     downstream = np.maximum(np.asarray(downstream_sigma2, dtype=float), floor)
@@ -595,68 +664,50 @@ def build_exponential_fitted_updated_rho(tau_array, rho_raw, rho_target, rho_dow
 
 
 
-def residual_update_autocorrelation_first_zero(rho_inlet, rho_target, rho_downstream, tau_array=None, relaxation_factor=0.9, clip=True, zero_tol=0.0, zero_persistence_points=1, zero_lookahead_points=0):
-    """Residual autocorrelation update without exponential fitting.
+def residual_update_autocorrelation_full_raw(rho_inlet, rho_target, rho_downstream, tau_array=None, relaxation_factor=0.35, clip=True, zero_tol=0.0, zero_persistence_points=1, zero_lookahead_points=0):
+    """Residual autocorrelation update using the full raw updated autocorrelation.
 
-    Uses the raw updated rho = rho_inlet + relaxation_factor*(rho_target-rho_downstream),
-    then truncates/controls the low-frequency autocorrelation branch at its first zero.
-    This preserves the non-parametric autocorrelation shape instead of imposing a
-    stretched-exponential fit.
+    Uses the raw updated rho = rho_inlet + relaxation_factor*(rho_target-rho_downstream)
+    over the full tau range. This is then transformed to an autocorrelation-derived
+    spectrum, but only the low-frequency portion is used in the final hybrid blend.
+    Any resulting high-frequency noise from the raw rho tail is therefore acceptable.
     """
-    rho_raw = rho_inlet + relaxation_factor * (rho_target - rho_downstream)
+    rho_updated = rho_inlet + relaxation_factor * (rho_target - rho_downstream)
     if clip:
-        rho_raw = np.clip(rho_raw, -1.0, 1.0)
-    rho_raw[:, :, 0] = 1.0
+        rho_updated = np.clip(rho_updated, -1.0, 1.0)
+    rho_updated[:, :, 0] = 1.0
 
-    rho_updated = np.empty_like(rho_raw)
     diagnostics = {
-        "updated_zero_id": np.zeros(rho_raw.shape[:2], dtype=int),
-        "selected_zero_id": np.zeros(rho_raw.shape[:2], dtype=int),
-        "selected_zero_tau": np.full(rho_raw.shape[:2], np.nan, dtype=float),
-        "target_zero_id": np.zeros(rho_raw.shape[:2], dtype=int),
-        "downstream_zero_id": np.zeros(rho_raw.shape[:2], dtype=int),
-        "fit_T": np.full(rho_raw.shape[:2], np.nan, dtype=float),
-        "fit_p": np.full(rho_raw.shape[:2], np.nan, dtype=float),
-        "fitted_zero_tau": np.full(rho_raw.shape[:2], np.nan, dtype=float),
-        "n_fit_points": np.zeros(rho_raw.shape[:2], dtype=int),
-        "fit_used_fallback": np.zeros(rho_raw.shape[:2], dtype=bool),
-        "zero_source": np.empty(rho_raw.shape[:2], dtype=object),
+        "updated_zero_id": np.zeros(rho_updated.shape[:2], dtype=int),
+        "selected_zero_id": np.zeros(rho_updated.shape[:2], dtype=int),
+        "selected_zero_tau": np.full(rho_updated.shape[:2], np.nan, dtype=float),
+        "target_zero_id": np.zeros(rho_updated.shape[:2], dtype=int),
+        "downstream_zero_id": np.zeros(rho_updated.shape[:2], dtype=int),
+        "fit_T": np.full(rho_updated.shape[:2], np.nan, dtype=float),
+        "fit_p": np.full(rho_updated.shape[:2], np.nan, dtype=float),
+        "fitted_zero_tau": np.full(rho_updated.shape[:2], np.nan, dtype=float),
+        "n_fit_points": np.zeros(rho_updated.shape[:2], dtype=int),
+        "fit_used_fallback": np.zeros(rho_updated.shape[:2], dtype=bool),
+        "zero_source": np.empty(rho_updated.shape[:2], dtype=object),
     }
     tau_values = np.asarray(tau_array, dtype=float) if tau_array is not None else None
 
-    for comp_id in range(rho_raw.shape[0]):
-        for h_id in range(rho_raw.shape[1]):
-            raw_1d = rho_raw[comp_id, h_id, :]
+    for comp_id in range(rho_updated.shape[0]):
+        for h_id in range(rho_updated.shape[1]):
+            updated_1d = rho_updated[comp_id, h_id, :]
             target_1d = rho_target[comp_id, h_id, :]
             downstream_1d = rho_downstream[comp_id, h_id, :]
 
-            updated_zero_id = first_zero_index(raw_1d, 1, zero_tol, zero_persistence_points, zero_lookahead_points)
+            updated_zero_id = first_zero_index(updated_1d, 1, zero_tol, zero_persistence_points, zero_lookahead_points)
             target_zero_id = first_zero_index(target_1d, 1, zero_tol, zero_persistence_points, zero_lookahead_points)
             downstream_zero_id = first_zero_index(downstream_1d, 1, zero_tol, zero_persistence_points, zero_lookahead_points)
 
-            updated_1d = np.zeros_like(raw_1d)
-            updated_1d[: updated_zero_id + 1] = raw_1d[: updated_zero_id + 1]
-            updated_1d[0] = 1.0
-            updated_1d[updated_zero_id] = 0.0
-
-            # After the updated first zero, use the target tail shifted to maintain
-            # a consistent post-zero shape without fitting a parametric model.
-            for i in range(updated_zero_id + 1, len(raw_1d)):
-                offset = i - updated_zero_id
-                target_i = target_zero_id + offset
-                updated_1d[i] = target_1d[target_i] if target_i < len(target_1d) else target_1d[-1]
-
-            if clip:
-                updated_1d = np.clip(updated_1d, -1.0, 1.0)
-                updated_1d[0] = 1.0
-
-            rho_updated[comp_id, h_id, :] = updated_1d
             diagnostics["updated_zero_id"][comp_id, h_id] = updated_zero_id
             diagnostics["selected_zero_id"][comp_id, h_id] = updated_zero_id
             diagnostics["selected_zero_tau"][comp_id, h_id] = float(tau_values[updated_zero_id]) if tau_values is not None and updated_zero_id < len(tau_values) else float(updated_zero_id)
             diagnostics["target_zero_id"][comp_id, h_id] = target_zero_id
             diagnostics["downstream_zero_id"][comp_id, h_id] = downstream_zero_id
-            diagnostics["zero_source"][comp_id, h_id] = "raw_first_zero"
+            diagnostics["zero_source"][comp_id, h_id] = "raw_full"
 
     return rho_updated, diagnostics
 
@@ -1165,7 +1216,7 @@ def plot_autocorrelation_comparison(fig_dir, z_array, tau_array, rho_inlet, rho_
             ax.plot(tau_array, rho_downstream[comp_id, h_id, :], label="Downstream from time series")
             ax.plot(tau_array, rho_target[comp_id, h_id, :], label="Target from spectra")
             ax.plot(tau_array, rho_raw_update[comp_id, h_id, :], linestyle="--", alpha=0.8, label="Raw Wong-updated rho")
-            ax.plot(tau_array, rho_fitted[comp_id, h_id, :], label="Fitted updated rho")
+            ax.plot(tau_array, rho_fitted[comp_id, h_id, :], label="Updated rho (full raw)")
             ax.axhline(0.0, linestyle="--", linewidth=1.0, color="k", alpha=0.5)
             ax.set_xlabel(r"$\tau$ [s]")
             ax.set_ylabel(r"$\rho(\tau)$")
@@ -1241,6 +1292,565 @@ def plot_length_profiles(fig_dir, z_array, body_height, L_inlet, L_downstream, L
         plt.close(fig)
 
 
+
+#%% --------------------------------------------------------------------------
+# u-w co-spectrum / cross-covariance helpers
+# ---------------------------------------------------------------------------
+
+def _find_first_existing_profile_column(df, candidates):
+    if df is None:
+        return None
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        key = str(cand).strip().lower()
+        if key in lower_map:
+            return lower_map[key]
+    return None
+
+
+def get_uw_stress_from_profile_df_or_fallback(profile_df, profile_array, candidates=UW_TARGET_STRESS_COLUMN_CANDIDATES, fallback_rho=UW_FALLBACK_RHO):
+    """Return uwStress(z), preferring an explicit profile column if present.
+
+    profile_array is expected to contain [U, var_u, var_v, var_w, Lu, Lv, Lw].
+    The fallback is rho_uw * sigma_u * sigma_w.
+    """
+    col = _find_first_existing_profile_column(profile_df, candidates)
+    if col is not None:
+        values = pd.to_numeric(profile_df[col], errors="coerce").to_numpy(dtype=float)
+        if np.all(np.isfinite(values)):
+            return values, f"profile_column:{col}"
+    arr = np.asarray(profile_array, dtype=float)
+    sigma_u = np.sqrt(np.maximum(arr[:, 1], 0.0))
+    sigma_w = np.sqrt(np.maximum(arr[:, 3], 0.0))
+    return float(fallback_rho) * sigma_u * sigma_w, f"fallback_rho:{fallback_rho}"
+
+
+def read_spectra_profile_file_extended(case_path, filename, n_freq_expected=None):
+    """Read spectraProfile variants.
+
+    Supported rows after the header:
+      legacy:      z Su Sv Sw
+      augmented:   z uwStress Su Sv Sw
+      full:        z uwStress Su Sv Sw Cuw
+
+    where each spectral block has nFreq entries. Returns
+    (spectra_array, z_array, uw_stress_or_None, cuw_array_or_None).
+    """
+    filepath = os.path.join(case_path, "constant", "boundaryData", "windProfile", filename)
+    with open(filepath, "r") as f:
+        header = f.readline().split()
+    if len(header) != 2:
+        raise ValueError(f"Invalid spectra profile header in {filepath}")
+    n_heights = int(header[0])
+    n_freq = int(header[1])
+    if n_freq_expected is not None and int(n_freq_expected) != n_freq:
+        raise ValueError(f"{filepath} has nFreq={n_freq}, expected {n_freq_expected}")
+    data = np.loadtxt(filepath, skiprows=1)
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    if data.shape[0] != n_heights:
+        raise ValueError(f"Expected {n_heights} rows in {filepath}, found {data.shape[0]}")
+    z = data[:, 0].astype(float)
+    ncols = data.shape[1]
+    legacy_cols = 1 + 3 * n_freq
+    augmented_cols = 2 + 3 * n_freq
+    full_cols = 2 + 4 * n_freq
+    uw = None
+    cuw = None
+    if ncols == legacy_cols:
+        start = 1
+    elif ncols == augmented_cols:
+        uw = data[:, 1].astype(float)
+        start = 2
+    elif ncols == full_cols:
+        uw = data[:, 1].astype(float)
+        start = 2
+        cuw = data[:, start + 3 * n_freq:start + 4 * n_freq].astype(float)
+    else:
+        raise ValueError(
+            f"Unexpected number of columns in {filepath}: {ncols}. "
+            f"Expected {legacy_cols}, {augmented_cols}, or {full_cols}."
+        )
+    spectra = np.zeros((3, n_heights, n_freq), dtype=float)
+    spectra[0, :, :] = data[:, start:start + n_freq]
+    spectra[1, :, :] = data[:, start + n_freq:start + 2 * n_freq]
+    spectra[2, :, :] = data[:, start + 2 * n_freq:start + 3 * n_freq]
+    return spectra, z, uw, cuw
+
+
+def read_uw_cospectrum_profile(case_path, filename=SPECTRA_PROFILE_UW_FILENAME, n_freq_expected=None):
+    filepath = os.path.join(case_path, "constant", "boundaryData", "windProfile", filename)
+    if not os.path.exists(filepath):
+        return None, None, None
+    with open(filepath, "r") as f:
+        header = f.readline().split()
+    if len(header) != 2:
+        raise ValueError(f"Invalid uw co-spectrum profile header in {filepath}")
+    n_heights = int(header[0])
+    n_freq = int(header[1])
+    if n_freq_expected is not None and int(n_freq_expected) != n_freq:
+        raise ValueError(f"{filepath} has nFreq={n_freq}, expected {n_freq_expected}")
+    data = np.loadtxt(filepath, skiprows=1)
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    if data.shape[0] != n_heights:
+        raise ValueError(f"Expected {n_heights} rows in {filepath}, found {data.shape[0]}")
+    expected_cols = 2 + n_freq
+    if data.shape[1] != expected_cols:
+        raise ValueError(f"Expected {expected_cols} columns in {filepath}, found {data.shape[1]}")
+    return data[:, 2:].astype(float), data[:, 0].astype(float), data[:, 1].astype(float)
+
+
+def write_spectra_profile_with_optional_uw(spectra_array, z_array, output_path, uw_stress=None, cuw_array=None, clip_min=1e-16):
+    spectra = np.asarray(spectra_array, dtype=float)
+    z = np.asarray(z_array, dtype=float)
+    n_comp, n_heights, n_freq = spectra.shape
+    if n_comp != 3:
+        raise ValueError("spectra_array must have shape (3, nHeights, nFreq)")
+    safe_makedirs(os.path.dirname(output_path))
+    rows = []
+    for h in range(n_heights):
+        row = [z[h]]
+        if uw_stress is not None:
+            row.append(float(np.asarray(uw_stress, dtype=float)[h]))
+        row.extend(np.maximum(spectra[0, h, :], clip_min))
+        row.extend(np.maximum(spectra[1, h, :], clip_min))
+        row.extend(np.maximum(spectra[2, h, :], clip_min))
+        if cuw_array is not None:
+            row.extend(np.asarray(cuw_array, dtype=float)[h, :])
+        rows.append(row)
+    with open(_windows_long_path(output_path), "w") as f:
+        f.write(f"{n_heights} {n_freq}\n")
+        np.savetxt(f, np.asarray(rows), fmt="%.10e", delimiter="\t")
+
+
+def write_uw_cospectrum_profile(cuw_array, z_array, uw_stress, output_path):
+    C = np.asarray(cuw_array, dtype=float)
+    z = np.asarray(z_array, dtype=float)
+    uw = np.asarray(uw_stress, dtype=float)
+    n_heights, n_freq = C.shape
+    safe_makedirs(os.path.dirname(output_path))
+    rows = []
+    for h in range(n_heights):
+        rows.append(np.r_[z[h], uw[h], C[h, :]])
+    with open(_windows_long_path(output_path), "w") as f:
+        f.write(f"{n_heights} {n_freq}\n")
+        np.savetxt(f, np.asarray(rows), fmt="%.10e", delimiter="\t")
+
+
+def write_new_dfsr_inlet_profile_with_uw(new_inlet_profile_array, target_profile_df, case_path, uw_stress=None):
+    output_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", "profile")
+    arr = np.asarray(new_inlet_profile_array, dtype=float)
+    df = pd.DataFrame({
+        "z": target_profile_df["z"].to_numpy(dtype=float),
+        "U": arr[:, 0],
+        "Iu": np.sqrt(np.maximum(arr[:, 1], 0.0)) / np.maximum(arr[:, 0], 1e-12),
+        "Iv": np.sqrt(np.maximum(arr[:, 2], 0.0)) / np.maximum(arr[:, 0], 1e-12),
+        "Iw": np.sqrt(np.maximum(arr[:, 3], 0.0)) / np.maximum(arr[:, 0], 1e-12),
+        "Lu": arr[:, 4],
+        "Lv": arr[:, 5],
+        "Lw": arr[:, 6],
+    })
+    if uw_stress is not None:
+        df["uwStress"] = np.asarray(uw_stress, dtype=float)
+    np.savetxt(_windows_long_path(output_path), df.to_numpy(), fmt="%.10e", delimiter="\t")
+
+
+def kaimal_uw_cospectrum_shape(freq_array, z_array, U_array, floor=1e-30):
+    """Neutral Kaimal uw co-spectrum shape per Hz, with negative sign.
+
+    Formula: -n Cuw(n) / u_*^2 = 14 f / (1 + 9.6 f)^2.4,
+    f = n z / U. Since only shape is needed, u_*^2 is omitted and
+    Cuw_shape = -14 z/U / (1 + 9.6 f)^2.4.
+    """
+    f = np.asarray(freq_array, dtype=float)
+    z = np.maximum(np.asarray(z_array, dtype=float), floor)
+    U = np.maximum(np.asarray(U_array, dtype=float), floor)
+    out = np.zeros((len(z), len(f)), dtype=float)
+    for h in range(len(z)):
+        fr = f * z[h] / U[h]
+        out[h, :] = -14.0 * (z[h] / U[h]) / np.power(1.0 + 9.6 * fr, 2.4)
+    return out
+
+
+def normalise_cospectrum_to_stress(freq_array, shape_array, uw_stress, floor=1e-30):
+    f = np.asarray(freq_array, dtype=float)
+    shape = np.asarray(shape_array, dtype=float).copy()
+    uw = np.asarray(uw_stress, dtype=float)
+    out = np.zeros_like(shape)
+    for h in range(shape.shape[0]):
+        area = _trapz(shape[h, :], f)
+        if not np.isfinite(area) or abs(area) < floor:
+            out[h, :] = 0.0
+        else:
+            out[h, :] = shape[h, :] * (uw[h] / area)
+    return out
+
+
+def integrate_cospectrum_area(freq_array, cospectrum_array, f_min=None, f_max=None):
+    f = np.asarray(freq_array, dtype=float)
+    C = np.asarray(cospectrum_array, dtype=float)
+    area = np.zeros(C.shape[0], dtype=float)
+    for h in range(C.shape[0]):
+        mask = _band_mask_for_height(f, h, f_min=f_min, f_max=f_max)
+        if np.count_nonzero(mask) >= 2:
+            area[h] = _trapz(C[h, mask], f[mask])
+        else:
+            area[h] = np.nan
+    return area
+
+
+def wong_update_uw_stress(inlet_uw, target_uw, downstream_uw, relaxation_factor=0.35):
+    """Additive relaxed stress update. Ratio-Wong update is avoided for signed stresses."""
+    inlet = np.asarray(inlet_uw, dtype=float)
+    target = np.asarray(target_uw, dtype=float)
+    downstream = np.asarray(downstream_uw, dtype=float)
+    return inlet + relaxation_factor * (target - downstream)
+
+
+def _multitaper_csd_1d(x, y, fs, time_bandwidth=4.0, num_tapers=None, detrend=True):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 8:
+        raise ValueError("Time series too short for multitaper CSD.")
+    if detrend:
+        x = x - np.mean(x)
+        y = y - np.mean(y)
+    n = x.size
+    if num_tapers is None:
+        num_tapers = max(1, int(2 * time_bandwidth) - 1)
+    tapers, eigvals = dpss(n, time_bandwidth, Kmax=num_tapers, return_ratios=True)
+    spectra = []
+    for taper in tapers:
+        X = rfft(x * taper)
+        Y = rfft(y * taper)
+        scale = fs * np.sum(taper ** 2)
+        Sxy = (np.conj(X) * Y) / scale
+        if n % 2 == 0:
+            Sxy[1:-1] *= 2.0
+        else:
+            Sxy[1:] *= 2.0
+        spectra.append(Sxy)
+    S_mt = np.average(np.vstack(spectra), axis=0, weights=eigvals)
+    return rfftfreq(n, d=1.0 / fs), S_mt
+
+
+def _interp_signed_linear(f_old, y_old, f_new):
+    f_old = np.asarray(f_old, dtype=float)
+    y_old = np.asarray(y_old, dtype=float)
+    f_new = np.asarray(f_new, dtype=float)
+    mask = np.isfinite(f_old) & np.isfinite(y_old) & (f_old > 0.0)
+    if np.count_nonzero(mask) < 2:
+        return np.zeros_like(f_new, dtype=float)
+    f_old = f_old[mask]
+    y_old = y_old[mask]
+    order = np.argsort(f_old)
+    return np.interp(f_new, f_old[order], y_old[order], left=y_old[order][0], right=y_old[order][-1])
+
+
+def smooth_signed_negative_cospectrum_1d(freq_array, C_1d, band_config, floor=1e-20, f_fit_min=1.0, f_fit_max=None, min_points_per_bin=4, left_mode="band_median", right_mode="slope", right_slope_clip=(-8.0, 0.0), low_plateau_band=(0.2, 1.0), smooth_knots=True, knot_smooth_kernel=(1,2,1)):
+    """Smooth a mostly-negative co-spectrum by fitting log(-C)."""
+    f = np.asarray(freq_array, dtype=float)
+    C = np.asarray(C_1d, dtype=float)
+    M = np.maximum(-C, floor)
+    try:
+        S_fit, knot_dict, _ = LES._profileCalibration.smooth_log_spectrum_1d_binned_pchip(
+            f,
+            M,
+            band_config=band_config,
+            floor=floor,
+            f_fit_min=f_fit_min,
+            f_fit_max=f_fit_max,
+            min_points_per_bin=min_points_per_bin,
+            left_mode=left_mode,
+            right_mode=right_mode,
+            right_slope_clip=right_slope_clip,
+            low_plateau_band=low_plateau_band,
+            smooth_knots=smooth_knots,
+            knot_smooth_kernel=knot_smooth_kernel,
+        )
+        C_fit = -np.maximum(S_fit, floor)
+        if knot_dict is not None:
+            knot_dict = dict(knot_dict)
+            knot_dict["C_knots"] = -np.maximum(knot_dict.get("S_knots", np.array([])), floor)
+        return C_fit, knot_dict
+    except Exception:
+        return -M, {"f_knots": np.array([]), "S_knots": np.array([]), "C_knots": np.array([])}
+
+
+def get_downstream_uw_cospectrum_array(fMax, nFreq, vel_array_3d, time_step, time_bandwidth=4.0, num_tapers=None):
+    fs = 1.0 / time_step
+    target_f = LES._profileCalibration.get_freq_array(fMax, nFreq)
+    n_heights = vel_array_3d.shape[2]
+    C_fit_array = np.zeros((n_heights, nFreq), dtype=float)
+    raw = [None for _ in range(n_heights)]
+    binned = [None for _ in range(n_heights)]
+    for h in range(n_heights):
+        u = vel_array_3d[0, :, h]
+        w = vel_array_3d[2, :, h]
+        raw_f, raw_Suw = _multitaper_csd_1d(u, w, fs, time_bandwidth=time_bandwidth, num_tapers=num_tapers)
+        raw_C = np.real(raw_Suw)
+        raw_on_grid = _interp_signed_linear(raw_f[(raw_f > 0.0) & (raw_f <= fMax)], raw_C[(raw_f > 0.0) & (raw_f <= fMax)], target_f)
+        if UW_ENFORCE_NEGATIVE_COSPECTRUM:
+            raw_on_grid = -np.maximum(-raw_on_grid, UW_MAGNITUDE_FLOOR)
+        C_fit, knot_dict = smooth_signed_negative_cospectrum_1d(
+            target_f,
+            raw_on_grid,
+            band_config=UW_BAND_CONFIG,
+            floor=UW_MAGNITUDE_FLOOR,
+            f_fit_min=UW_PSD_FIT_MIN,
+            f_fit_max=UW_PSD_FIT_MAX,
+            min_points_per_bin=UW_MIN_POINTS_PER_BIN,
+            left_mode=UW_LEFT_MODE,
+            right_mode=UW_RIGHT_MODE,
+            right_slope_clip=UW_RIGHT_SLOPE_CLIP,
+            low_plateau_band=UW_LOW_PLATEAU_BAND,
+            smooth_knots=UW_SMOOTH_KNOTS,
+            knot_smooth_kernel=UW_KNOT_SMOOTH_KERNEL,
+        )
+        C_fit_array[h, :] = C_fit
+        raw[h] = (target_f, raw_on_grid)
+        if knot_dict is None:
+            binned[h] = (np.array([]), np.array([]))
+        else:
+            binned[h] = (np.asarray(knot_dict.get("f_knots", []), dtype=float), np.asarray(knot_dict.get("C_knots", []), dtype=float))
+    return C_fit_array, raw, binned
+
+
+def smooth_cospectrum_height_kernel(z_array, C_array, kernel_weights=(1,2,1)):
+    C = np.asarray(C_array, dtype=float).copy()
+    if kernel_weights is None or len(kernel_weights) <= 1:
+        return C
+    out = C.copy()
+    for f_id in range(C.shape[1]):
+        # Smooth log magnitude, preserve negative sign.
+        mag = np.maximum(-C[:, f_id], UW_MAGNITUDE_FLOOR)
+        sm = _smooth_1d_with_kernel(np.log(mag), kernel_weights)
+        out[:, f_id] = -np.exp(sm)
+    return out
+
+
+def get_first_uw_knot_frequency_array(uw_binned, n_heights, fallback=1.0):
+    out = np.full(n_heights, fallback, dtype=float)
+    for h in range(n_heights):
+        item = uw_binned[h]
+        if item is None:
+            continue
+        f_knots = np.asarray(item[0], dtype=float)
+        f_knots = f_knots[np.isfinite(f_knots) & (f_knots > 0.0)]
+        if len(f_knots) > 0:
+            out[h] = f_knots[0]
+    return out
+
+
+def get_uw_knot_frequency_lists(uw_binned, n_heights, fallback=1.0):
+    out = []
+    for h in range(n_heights):
+        item = uw_binned[h]
+        if item is None:
+            out.append(np.array([fallback], dtype=float))
+            continue
+        f_knots = np.asarray(item[0], dtype=float)
+        f_knots = f_knots[np.isfinite(f_knots) & (f_knots > 0.0)]
+        if len(f_knots) == 0:
+            f_knots = np.array([fallback], dtype=float)
+        out.append(f_knots)
+    return out
+
+
+def cross_covariance_fft_1d(x, y, max_lags=None):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask] - np.nanmean(x[mask])
+    y = y[mask] - np.nanmean(y[mask])
+    n = len(x)
+    if max_lags is None or max_lags > n:
+        max_lags = n
+    nfft = 1 << (2 * n - 1).bit_length()
+    X = np.fft.fft(x, nfft)
+    Y = np.fft.fft(y, nfft)
+    # R_uw(tau) = <u(t+tau) w(t)> for tau >= 0.
+    corr = np.fft.ifft(np.conj(X) * Y).real[:max_lags]
+    denom = np.arange(n, n - max_lags, -1, dtype=float)
+    return corr / np.maximum(denom, 1.0)
+
+
+def cross_covariance_array_from_velocity(vel_array_3d, max_lags):
+    n_heights = vel_array_3d.shape[2]
+    out = np.zeros((n_heights, max_lags), dtype=float)
+    for h in range(n_heights):
+        out[h, :] = cross_covariance_fft_1d(vel_array_3d[0, :, h], vel_array_3d[2, :, h], max_lags=max_lags)
+    return out
+
+
+def cross_covariance_from_cospectrum(freq_array, C_array, tau_array, f_min=None, f_max=None):
+    f = np.asarray(freq_array, dtype=float)
+    tau = np.asarray(tau_array, dtype=float)
+    C = np.asarray(C_array, dtype=float)
+    out = np.zeros((C.shape[0], len(tau)), dtype=float)
+    for h in range(C.shape[0]):
+        mask = _band_mask_for_height(f, h, f_min=f_min, f_max=f_max)
+        if np.count_nonzero(mask) < 2:
+            continue
+        cos_matrix = np.cos(2.0 * np.pi * tau[:, np.newaxis] * f[mask][np.newaxis, :])
+        out[h, :] = _trapz(C[h, mask][np.newaxis, :] * cos_matrix, f[mask], axis=1)
+    return out
+
+
+def cospectrum_from_cross_covariance(tau_array, R_array, freq_array, apply_taper=True, taper_start_fraction=0.75):
+    tau = np.asarray(tau_array, dtype=float)
+    f = np.asarray(freq_array, dtype=float)
+    R = np.asarray(R_array, dtype=float).copy()
+    if apply_taper and len(tau) > 4:
+        start = int(np.clip(round(taper_start_fraction * len(tau)), 1, len(tau) - 1))
+        taper = np.ones(len(tau), dtype=float)
+        tail = len(tau) - start
+        taper[start:] = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, tail)))
+        R *= taper[np.newaxis, :]
+    out = np.zeros((R.shape[0], len(f)), dtype=float)
+    for h in range(R.shape[0]):
+        cos_matrix = np.cos(2.0 * np.pi * f[:, np.newaxis] * tau[np.newaxis, :])
+        # For a one-sided co-spectrum convention: R(tau) = int C(f) cos(2pi f tau) df.
+        # The inverse is approximated with 2 * int R(tau) cos(2pi f tau) d tau.
+        out[h, :] = 2.0 * _trapz(R[h, :][np.newaxis, :] * cos_matrix, tau, axis=1)
+    return out
+
+
+def build_join_matched_signed_cospectrum(freq_array, spectral_baseline_C, crosscov_C, spectral_knot_freqs, first_knot_freqs, floor=1e-20, low_n_knots=8, low_max_fraction_of_first_knot=0.95, ratio_min=0.5, ratio_max=2.0, f_min_for_low=None, add_endpoint_anchors=True, join_scale_min=0.33, join_scale_max=3.0):
+    f = np.asarray(freq_array, dtype=float)
+    C_spec = np.asarray(spectral_baseline_C, dtype=float)
+    C_low = np.asarray(crosscov_C, dtype=float)
+    n_heights = C_spec.shape[0]
+    hybrid = np.zeros_like(C_spec)
+    matched_low = np.zeros_like(C_low)
+    rows = []
+    knot_store = [[None] for _ in range(n_heights)]
+    for h in range(n_heights):
+        spec = C_spec[h, :].copy()
+        low = C_low[h, :].copy()
+        if UW_ENFORCE_NEGATIVE_COSPECTRUM:
+            spec = -np.maximum(-spec, floor)
+            low = -np.maximum(-low, floor)
+        f_join = float(first_knot_freqs[h]) if np.isfinite(first_knot_freqs[h]) else UW_HYBRID_FIRST_KNOT_FALLBACK
+        f_join = float(np.clip(f_join, f[0], f[-1]))
+        spec_join = np.interp(np.log(f_join), np.log(f), spec)
+        low_join = np.interp(np.log(f_join), np.log(f), low)
+        raw_scale = spec_join / low_join if abs(low_join) > floor else 1.0
+        # Use only positive scale. If signs disagree, use no scale and rely on clipping/fallback magnitude.
+        if not np.isfinite(raw_scale) or raw_scale <= 0.0:
+            raw_scale = 1.0
+        scale = float(np.clip(raw_scale, join_scale_min, join_scale_max))
+        low_shift = low * scale
+        if UW_ENFORCE_NEGATIVE_COSPECTRUM:
+            # Bound shifted low branch magnitude relative to spectral branch.
+            low_mag = np.maximum(-low_shift, floor)
+            spec_mag = np.maximum(-spec, floor)
+            low_mag = np.clip(low_mag, ratio_min * spec_mag, ratio_max * spec_mag)
+            low_shift = -low_mag
+        matched_low[h, :] = low_shift
+        low_knots_f, low_knots_C = get_autocorr_low_frequency_knots_explicit(
+            freq_array=f,
+            autocorr_spectrum_1d=-low_shift if UW_ENFORCE_NEGATIVE_COSPECTRUM else np.abs(low_shift),
+            first_spectral_knot_freq=f_join,
+            n_knots=low_n_knots,
+            max_fraction_of_first_knot=low_max_fraction_of_first_knot,
+            min_points_per_bin=HYBRID_LOW_FREQ_MIN_POINTS_PER_BIN,
+            floor=floor,
+            f_min_for_low=f_min_for_low,
+        )
+        low_knots_C = -np.maximum(low_knots_C, floor) if UW_ENFORCE_NEGATIVE_COSPECTRUM else low_knots_C
+        f_spec_knots = np.asarray(spectral_knot_freqs[h], dtype=float)
+        f_spec_knots = f_spec_knots[np.isfinite(f_spec_knots) & (f_spec_knots > 0.0)]
+        if len(f_spec_knots) == 0:
+            f_spec_knots = np.array([f_join], dtype=float)
+        C_spec_knots = np.interp(np.log(f_spec_knots), np.log(f), spec)
+        all_f = np.r_[low_knots_f, f_spec_knots]
+        all_C = np.r_[low_knots_C, C_spec_knots]
+        if add_endpoint_anchors:
+            all_f = np.r_[f[0], all_f, f[-1]]
+            all_C = np.r_[low_shift[0], all_C, spec[-1]]
+        valid = np.isfinite(all_f) & np.isfinite(all_C) & (all_f > 0.0) & (np.abs(all_C) > floor)
+        all_f = all_f[valid]
+        all_C = all_C[valid]
+        order = np.argsort(all_f)
+        all_f = all_f[order]
+        all_C = all_C[order]
+        all_f, all_C = _merge_duplicate_x(all_f, all_C)
+        if len(all_f) >= 2:
+            logf = np.log(all_f)
+            logmag = np.log(np.maximum(np.abs(all_C), floor))
+            interp = PchipInterpolator(logf, logmag, extrapolate=True)
+            mag = np.exp(interp(np.log(f)))
+            sign = -1.0 if UW_ENFORCE_NEGATIVE_COSPECTRUM else np.sign(np.nanmedian(all_C)) or -1.0
+            hybrid[h, :] = sign * mag
+        else:
+            hybrid[h, :] = spec
+        knot_store[h][0] = {"f": all_f, "C": all_C}
+        rows.append({
+            "height_id": h,
+            "first_spectral_knot_freq": f_join,
+            "raw_join_scale": raw_scale,
+            "applied_join_scale": scale,
+            "join_scale_was_clipped": bool(abs(scale - raw_scale) > 1e-12),
+            "n_low_knots": int(len(low_knots_f)),
+            "n_total_knots": int(len(all_f)),
+        })
+    return hybrid, pd.DataFrame(rows), knot_store, matched_low
+
+
+def clip_cospectrum_to_realisability(C_array, Su_array, Sw_array, rho_max=0.95, floor=1e-30):
+    C = np.asarray(C_array, dtype=float).copy()
+    bound = float(rho_max) * np.sqrt(np.maximum(Su_array, floor) * np.maximum(Sw_array, floor))
+    C_clipped = np.clip(C, -bound, bound)
+    clipped_fraction = np.mean(np.abs(C_clipped - C) > 1e-12)
+    return C_clipped, clipped_fraction, bound
+
+
+def plot_uw_cospectra(fig_dir, z_array, freq_array, inlet_C, target_C, downstream_C, spectral_C, crosscov_C, hybrid_C, first_knot_freqs, body_height, z_max_factor=3.0, n_heights=8):
+    safe_makedirs(fig_dir)
+    z = np.asarray(z_array, dtype=float)
+    candidates = np.where(z <= z_max_factor * body_height)[0]
+    if len(candidates) == 0:
+        candidates = np.arange(len(z))
+    ids = np.linspace(0, len(candidates)-1, min(n_heights, len(candidates)), dtype=int)
+    for h in candidates[ids]:
+        fig, ax = plt.subplots(figsize=(7.5, 5.0))
+        ax.loglog(freq_array, np.maximum(-inlet_C[h], UW_MAGNITUDE_FLOOR), label="Current inlet -Cuw")
+        ax.loglog(freq_array, np.maximum(-target_C[h], UW_MAGNITUDE_FLOOR), label="Target -Cuw")
+        ax.loglog(freq_array, np.maximum(-downstream_C[h], UW_MAGNITUDE_FLOOR), label="Downstream smoothed -Cuw")
+        ax.loglog(freq_array, np.maximum(-spectral_C[h], UW_MAGNITUDE_FLOOR), label="Spectral baseline -Cuw")
+        ax.loglog(freq_array, np.maximum(-crosscov_C[h], UW_MAGNITUDE_FLOOR), linestyle="--", alpha=0.75, label="Cross-cov derived -Cuw")
+        ax.loglog(freq_array, np.maximum(-hybrid_C[h], UW_MAGNITUDE_FLOOR), linewidth=2.0, label="Hybrid final -Cuw")
+        ax.axvline(first_knot_freqs[h], linestyle=":", alpha=0.5, label="join")
+        ax.set_xlabel("f [Hz]")
+        ax.set_ylabel("-Cuw [m2/s2/Hz]")
+        ax.set_title(f"u-w co-spectrum, z/H={z[h]/body_height:.2f}")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(fontsize=8)
+        safe_savefig(fig, os.path.join(fig_dir, f"uw_cospectrum_h{h:03d}.png"))
+        plt.close(fig)
+
+
+def plot_uw_stress_profiles(fig_dir, z_array, body_height, inlet_uw, downstream_uw, target_uw, updated_uw, final_uw):
+    safe_makedirs(fig_dir)
+    y = np.asarray(z_array, dtype=float) / body_height
+    fig, ax = plt.subplots(figsize=(6.5, 5.0))
+    ax.plot(inlet_uw, y, label="Current inlet")
+    ax.plot(downstream_uw, y, label="Downstream time series")
+    ax.plot(target_uw, y, label="Target")
+    ax.plot(updated_uw, y, label="Updated diagnostic")
+    ax.plot(final_uw, y, label="Final hybrid area")
+    ax.set_xlabel("uw stress [m2/s2]")
+    ax.set_ylabel("z/H")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    safe_savefig(fig, os.path.join(fig_dir, "uw_stress_profiles.png"))
+    plt.close(fig)
+
 #%% --------------------------------------------------------------------------
 # Case setup and baseline downstream profile calculation
 # ---------------------------------------------------------------------------
@@ -1306,8 +1916,18 @@ stagnated = iter_status["stagnated"]
 freq_array = LES._profileCalibration.get_freq_array(fMax, nFreq)
 z_array = target_profile_df["z"].to_numpy(dtype=float)
 
-target_spectra_array = LES._profileCalibration.read_spectra_profile_file(case_path, "targetSpectraProfile")
-inlet_spectra_array = LES._profileCalibration.read_spectra_profile_file(case_path, "spectraProfile")
+target_spectra_array, target_spectra_z, target_uw_from_spectra, target_cuw_from_spectra = read_spectra_profile_file_extended(case_path, "targetSpectraProfile", n_freq_expected=nFreq)
+inlet_spectra_array, inlet_spectra_z, inlet_uw_from_spectra, inlet_cuw_from_spectra = read_spectra_profile_file_extended(case_path, "spectraProfile", n_freq_expected=nFreq)
+
+# Optional separate u-w co-spectrum profile files override embedded Cuw blocks if present.
+_target_cuw_sep, _target_cuw_z, _target_cuw_stress = read_uw_cospectrum_profile(case_path, "targetUWCoSpectrumProfile", n_freq_expected=nFreq)
+_inlet_cuw_sep, _inlet_cuw_z, _inlet_cuw_stress = read_uw_cospectrum_profile(case_path, SPECTRA_PROFILE_UW_FILENAME, n_freq_expected=nFreq)
+if _target_cuw_sep is not None:
+    target_cuw_from_spectra = _target_cuw_sep
+    target_uw_from_spectra = _target_cuw_stress
+if _inlet_cuw_sep is not None:
+    inlet_cuw_from_spectra = _inlet_cuw_sep
+    inlet_uw_from_spectra = _inlet_cuw_stress
 
 fig_root = os.path.join(case_path, "log", f"it{iteration}", "hybrid")
 safe_makedirs(fig_root)
@@ -1481,7 +2101,7 @@ print(f"  downstream variance source = {DOWNSTREAM_VARIANCE_SOURCE}")
 
 
 #%% --------------------------------------------------------------------------
-# Autocorrelation-derived update spectrum used only to inform low-frequency ratio
+# Autocorrelation-derived update spectrum used only to inform the low-frequency hybrid branch
 # ---------------------------------------------------------------------------
 
 tau_array = make_tau_array_from_target_lengths(
@@ -1528,7 +2148,7 @@ if USE_EXPONENTIAL_RHO_FIT:
         max_zero_tau_factor=EXP_MAX_ZERO_TAU_FACTOR,
     )
 else:
-    rho_updated, autocorr_diag = residual_update_autocorrelation_first_zero(
+    rho_updated, autocorr_diag = residual_update_autocorrelation_full_raw(
         rho_inlet,
         rho_target,
         rho_downstream,
@@ -1562,10 +2182,177 @@ print(f"  autocorr spectrum negative fraction min/max = {np.nanmin(negative_frac
 
 
 #%% --------------------------------------------------------------------------
+# u-w co-spectrum branch: high-frequency Cuw + low-frequency cross-covariance
+# ---------------------------------------------------------------------------
+
+if INCLUDE_UW_COSPECTRAL_CALIBRATION:
+    print("\nu-w co-spectral / cross-covariance branch:")
+
+    target_uw_stress_profile, target_uw_source = get_uw_stress_from_profile_df_or_fallback(
+        target_profile_df,
+        target_profile_array,
+        fallback_rho=UW_FALLBACK_RHO,
+    )
+    # Current inlet profile files in legacy DFSR normally do not contain uwStress.
+    # Prefer spectraProfile:uwStress if present; otherwise use the rho fallback.
+    inlet_uw_stress_profile, inlet_uw_source = get_uw_stress_from_profile_df_or_fallback(
+        None,
+        inlet_profile_array,
+        fallback_rho=UW_FALLBACK_RHO,
+    )
+    if target_uw_from_spectra is not None:
+        target_uw_stress_profile = np.asarray(target_uw_from_spectra, dtype=float)
+        target_uw_source = "targetSpectraProfile:uwStress"
+    if inlet_uw_from_spectra is not None:
+        inlet_uw_stress_profile = np.asarray(inlet_uw_from_spectra, dtype=float)
+        inlet_uw_source = "spectraProfile:uwStress"
+
+    if target_cuw_from_spectra is None:
+        if not UW_USE_KAIMAL_IF_PROFILE_COSPECTRUM_MISSING:
+            raise ValueError("No target Cuw profile found and UW_USE_KAIMAL_IF_PROFILE_COSPECTRUM_MISSING is False.")
+        target_cuw_shape = kaimal_uw_cospectrum_shape(freq_array, z_array, target_profile_array[:, 0])
+        target_uw_cospectrum_array = normalise_cospectrum_to_stress(freq_array, target_cuw_shape, target_uw_stress_profile)
+        target_cuw_source = "KaimalShape_normalised_to_target_uwStress"
+    else:
+        target_uw_cospectrum_array = np.asarray(target_cuw_from_spectra, dtype=float)
+        target_cuw_source = "targetSpectraProfile_or_targetUWCoSpectrumProfile:Cuw"
+
+    if inlet_cuw_from_spectra is None:
+        inlet_cuw_shape = kaimal_uw_cospectrum_shape(freq_array, z_array, inlet_profile_array[:, 0])
+        inlet_uw_cospectrum_array = normalise_cospectrum_to_stress(freq_array, inlet_cuw_shape, inlet_uw_stress_profile)
+        inlet_cuw_source = "KaimalShape_normalised_to_inlet_uwStress"
+    else:
+        inlet_uw_cospectrum_array = np.asarray(inlet_cuw_from_spectra, dtype=float)
+        inlet_cuw_source = "spectraProfile_or_uwCoSpectrumProfile:Cuw"
+
+    if UW_ENFORCE_NEGATIVE_COSPECTRUM:
+        target_uw_cospectrum_array = -np.maximum(-target_uw_cospectrum_array, UW_MAGNITUDE_FLOOR)
+        inlet_uw_cospectrum_array = -np.maximum(-inlet_uw_cospectrum_array, UW_MAGNITUDE_FLOOR)
+
+    downstream_uw_cospectrum_array_rawfit, downstream_uw_raw, downstream_uw_binned = get_downstream_uw_cospectrum_array(
+        fMax,
+        nFreq,
+        vel_array_3d,
+        time_step,
+        time_bandwidth=4.0,
+        num_tapers=None,
+    )
+    downstream_uw_cospectrum_smoothed_array = smooth_cospectrum_height_kernel(
+        z_array,
+        downstream_uw_cospectrum_array_rawfit,
+        kernel_weights=UW_HEIGHT_KERNEL,
+    )
+
+    uw_first_knot_freqs = get_first_uw_knot_frequency_array(
+        downstream_uw_binned,
+        n_heights=len(z_array),
+        fallback=UW_HYBRID_FIRST_KNOT_FALLBACK,
+    )
+    uw_spectral_knot_freqs = get_uw_knot_frequency_lists(
+        downstream_uw_binned,
+        n_heights=len(z_array),
+        fallback=UW_HYBRID_FIRST_KNOT_FALLBACK,
+    )
+
+    Ruw_downstream = cross_covariance_array_from_velocity(vel_array_3d, max_lags=len(tau_array))
+    downstream_uw_stress_time_series = Ruw_downstream[:, 0]
+    updated_uw_stress_profile = wong_update_uw_stress(
+        inlet_uw_stress_profile,
+        target_uw_stress_profile,
+        downstream_uw_stress_time_series,
+        relaxation_factor=UW_STRESS_RELAXATION_FACTOR,
+    )
+
+    # High-frequency spectral residual update for Cuw(f).
+    uw_spectral_baseline_array = inlet_uw_cospectrum_array + UW_COSPECTRAL_RELAXATION_FACTOR * (
+        target_uw_cospectrum_array - downstream_uw_cospectrum_smoothed_array
+    )
+    if UW_ENFORCE_NEGATIVE_COSPECTRUM:
+        uw_spectral_baseline_array = -np.maximum(-uw_spectral_baseline_array, UW_MAGNITUDE_FLOOR)
+
+    # Low-frequency cross-covariance branch.
+    Ruw_inlet = cross_covariance_from_cospectrum(
+        freq_array,
+        inlet_uw_cospectrum_array,
+        tau_array,
+        f_min=resolved_f_min,
+        f_max=resolved_f_max,
+    )
+    Ruw_target = cross_covariance_from_cospectrum(
+        freq_array,
+        target_uw_cospectrum_array,
+        tau_array,
+        f_min=resolved_f_min,
+        f_max=resolved_f_max,
+    )
+    Ruw_updated = Ruw_inlet + UW_CROSSCOV_RELAXATION_FACTOR * (Ruw_target - Ruw_downstream)
+    Ruw_updated[:, 0] = updated_uw_stress_profile
+
+    uw_crosscov_cospectrum_array = cospectrum_from_cross_covariance(
+        tau_array,
+        Ruw_updated,
+        freq_array,
+        apply_taper=APPLY_AUTOCOVARIANCE_TAPER,
+        taper_start_fraction=TAPER_START_FRACTION,
+    )
+    if UW_ENFORCE_NEGATIVE_COSPECTRUM:
+        uw_crosscov_cospectrum_array = -np.maximum(-uw_crosscov_cospectrum_array, UW_MAGNITUDE_FLOOR)
+
+    hybrid_uw_cospectrum_preclip_array, uw_knot_diag_df, uw_knot_store, uw_crosscov_matched_array = build_join_matched_signed_cospectrum(
+        freq_array=freq_array,
+        spectral_baseline_C=uw_spectral_baseline_array,
+        crosscov_C=uw_crosscov_cospectrum_array,
+        spectral_knot_freqs=uw_spectral_knot_freqs,
+        first_knot_freqs=uw_first_knot_freqs,
+        floor=UW_MAGNITUDE_FLOOR,
+        low_n_knots=UW_HYBRID_LOW_FREQ_N_KNOTS,
+        low_max_fraction_of_first_knot=UW_HYBRID_LOW_FREQ_MAX_FRACTION_OF_FIRST_KNOT,
+        ratio_min=UW_HYBRID_LOW_FREQ_RATIO_MIN,
+        ratio_max=UW_HYBRID_LOW_FREQ_RATIO_MAX,
+        f_min_for_low=resolved_f_min,
+        add_endpoint_anchors=UW_HYBRID_ADD_ENDPOINT_ANCHORS,
+        join_scale_min=UW_HYBRID_JOIN_SCALE_MIN,
+        join_scale_max=UW_HYBRID_JOIN_SCALE_MAX,
+    )
+
+    if RENORMALISE_UW_COSPECTRUM_TO_UPDATED_STRESS:
+        hybrid_uw_cospectrum_preclip_array = normalise_cospectrum_to_stress(
+            freq_array,
+            hybrid_uw_cospectrum_preclip_array,
+            updated_uw_stress_profile,
+            floor=UW_MAGNITUDE_FLOOR,
+        )
+
+    print(f"  target uw source = {target_uw_source}")
+    print(f"  inlet uw source = {inlet_uw_source}")
+    print(f"  target Cuw source = {target_cuw_source}")
+    print(f"  inlet Cuw source = {inlet_cuw_source}")
+    print(f"  downstream uw stress min/max = {np.nanmin(downstream_uw_stress_time_series):.4g} / {np.nanmax(downstream_uw_stress_time_series):.4g}")
+    print(f"  updated uw stress min/max = {np.nanmin(updated_uw_stress_profile):.4g} / {np.nanmax(updated_uw_stress_profile):.4g}")
+    if len(uw_knot_diag_df) > 0:
+        print(f"  uw join scale applied min/max = {uw_knot_diag_df['applied_join_scale'].min():.4g} / {uw_knot_diag_df['applied_join_scale'].max():.4g}")
+else:
+    target_uw_stress_profile = None
+    inlet_uw_stress_profile = None
+    downstream_uw_stress_time_series = None
+    updated_uw_stress_profile = None
+    target_uw_cospectrum_array = None
+    inlet_uw_cospectrum_array = None
+    downstream_uw_cospectrum_smoothed_array = None
+    uw_spectral_baseline_array = None
+    uw_crosscov_cospectrum_array = None
+    uw_crosscov_matched_array = None
+    hybrid_uw_cospectrum_preclip_array = None
+    hybrid_uw_cospectrum_array = None
+    uw_knot_diag_df = pd.DataFrame()
+    uw_first_knot_freqs = None
+
+
+#%% --------------------------------------------------------------------------
 # Join-matched combined-knot hybrid spectrum
 # ---------------------------------------------------------------------------
 
-# Intended autocorrelation update length scale, retained for final diagnostics.
+# Intended autocorrelation update length scale from the full raw rho branch, retained for final diagnostics.
 L_acorr_update = integral_length_array_from_rho(tau_array, rho_updated, new_inlet_profile_array[:, 0])
 
 hybrid_spectra_array, knot_diag_df, knot_store, autocorr_spectra_matched_array = build_join_matched_combined_knot_spectrum(
@@ -1649,6 +2436,42 @@ if APPLY_POWER_LAW_TAIL:
 
 
 #%% --------------------------------------------------------------------------
+# Final u-w co-spectrum realizability against the final auto-spectra
+# ---------------------------------------------------------------------------
+
+if INCLUDE_UW_COSPECTRAL_CALIBRATION:
+    hybrid_uw_cospectrum_array, uw_realisability_clipped_fraction, uw_realisability_bound = clip_cospectrum_to_realisability(
+        hybrid_uw_cospectrum_preclip_array,
+        hybrid_spectra_array[0, :, :],
+        hybrid_spectra_array[2, :, :],
+        rho_max=UW_RHO_MAX,
+        floor=FLOOR,
+    )
+    final_uw_stress_resolved = integrate_cospectrum_area(
+        freq_array,
+        hybrid_uw_cospectrum_array,
+        f_min=resolved_f_min,
+        f_max=resolved_f_max,
+    )
+    preclip_uw_stress_resolved = integrate_cospectrum_area(
+        freq_array,
+        hybrid_uw_cospectrum_preclip_array,
+        f_min=resolved_f_min,
+        f_max=resolved_f_max,
+    )
+    uw_stress_rel_error = (final_uw_stress_resolved - updated_uw_stress_profile) / np.maximum(np.abs(updated_uw_stress_profile), FLOOR)
+    print("\nFinal u-w co-spectrum realizability diagnostics:")
+    print(f"  Cuw clipping fraction = {uw_realisability_clipped_fraction:.4g}")
+    print(f"  final uw stress rel error min/max = {np.nanmin(uw_stress_rel_error):.4g} / {np.nanmax(uw_stress_rel_error):.4g}")
+else:
+    final_uw_stress_resolved = None
+    preclip_uw_stress_resolved = None
+    uw_stress_rel_error = None
+    uw_realisability_clipped_fraction = None
+    uw_realisability_bound = None
+
+
+#%% --------------------------------------------------------------------------
 # Final diagnostics
 # ---------------------------------------------------------------------------
 
@@ -1702,6 +2525,42 @@ summary_df = pd.DataFrame(rows)
 summary_df.to_csv(os.path.join(fig_root, "summary.csv"), index=False)
 if len(knot_diag_df) > 0:
     knot_diag_df.to_csv(os.path.join(fig_root, "join_matched_knot_summary.csv"), index=False)
+
+if INCLUDE_UW_COSPECTRAL_CALIBRATION:
+    uw_rows = []
+    inlet_uw_area = integrate_cospectrum_area(freq_array, inlet_uw_cospectrum_array, f_min=resolved_f_min, f_max=resolved_f_max)
+    target_uw_area = integrate_cospectrum_area(freq_array, target_uw_cospectrum_array, f_min=resolved_f_min, f_max=resolved_f_max)
+    downstream_uw_area = integrate_cospectrum_area(freq_array, downstream_uw_cospectrum_smoothed_array, f_min=resolved_f_min, f_max=resolved_f_max)
+    spectral_uw_area = integrate_cospectrum_area(freq_array, uw_spectral_baseline_array, f_min=resolved_f_min, f_max=resolved_f_max)
+    crosscov_uw_area = integrate_cospectrum_area(freq_array, uw_crosscov_matched_array, f_min=resolved_f_min, f_max=resolved_f_max)
+    for h_id, z in enumerate(z_array):
+        join_row = uw_knot_diag_df.loc[uw_knot_diag_df["height_id"] == h_id] if len(uw_knot_diag_df) > 0 else pd.DataFrame()
+        uw_rows.append({
+            "height_id": h_id,
+            "z": z,
+            "z_over_H": z / building_height,
+            "resolved_f_min": resolved_f_min,
+            "resolved_f_max": resolved_f_max if np.ndim(resolved_f_max) == 0 else resolved_f_max[h_id],
+            "first_spline_freq": uw_first_knot_freqs[h_id],
+            "join_scale_applied": join_row["applied_join_scale"].iloc[0] if len(join_row) > 0 else np.nan,
+            "n_low_freq_knots": join_row["n_low_knots"].iloc[0] if len(join_row) > 0 else np.nan,
+            "uw_stress_inlet_profile": inlet_uw_stress_profile[h_id],
+            "uw_stress_downstream_time_series": downstream_uw_stress_time_series[h_id],
+            "uw_stress_target_profile": target_uw_stress_profile[h_id],
+            "uw_stress_updated_diagnostic": updated_uw_stress_profile[h_id],
+            "uw_area_inlet_cuw": inlet_uw_area[h_id],
+            "uw_area_target_cuw": target_uw_area[h_id],
+            "uw_area_downstream_cuw": downstream_uw_area[h_id],
+            "uw_area_spectral_baseline": spectral_uw_area[h_id],
+            "uw_area_crosscov_matched": crosscov_uw_area[h_id],
+            "uw_area_preclip_hybrid": preclip_uw_stress_resolved[h_id],
+            "uw_area_final_hybrid": final_uw_stress_resolved[h_id],
+            "uw_final_rel_error_vs_updated": uw_stress_rel_error[h_id],
+        })
+    uw_summary_df = pd.DataFrame(uw_rows)
+    uw_summary_df.to_csv(os.path.join(fig_root, "uw_cospectral_summary.csv"), index=False)
+    if len(uw_knot_diag_df) > 0:
+        uw_knot_diag_df.to_csv(os.path.join(fig_root, "uw_join_matched_knot_summary.csv"), index=False)
 
 print("\nFinal hybrid self-consistency diagnostics:")
 print(f"  sigma2 rel error min/max = {np.nanmin(final_sigma2_rel_error):.4g} / {np.nanmax(final_sigma2_rel_error):.4g}")
@@ -1809,6 +2668,33 @@ plot_length_profiles(
     components=COMPONENT_NAMES,
 )
 
+if INCLUDE_UW_COSPECTRAL_CALIBRATION:
+    plot_uw_cospectra(
+        os.path.join(fig_root, "09_uw_cospectra"),
+        z_array,
+        freq_array,
+        inlet_uw_cospectrum_array,
+        target_uw_cospectrum_array,
+        downstream_uw_cospectrum_smoothed_array,
+        uw_spectral_baseline_array,
+        uw_crosscov_matched_array,
+        hybrid_uw_cospectrum_array,
+        uw_first_knot_freqs,
+        building_height,
+        z_max_factor=Z_MAX_FACTOR_FINAL_SPECTRA,
+        n_heights=N_HEIGHTS_TO_PLOT,
+    )
+    plot_uw_stress_profiles(
+        os.path.join(fig_root, "10_uw_profiles"),
+        z_array,
+        building_height,
+        inlet_uw_stress_profile,
+        downstream_uw_stress_time_series,
+        target_uw_stress_profile,
+        updated_uw_stress_profile,
+        final_uw_stress_resolved,
+    )
+
 try:
     LES._plot.plot_spectral_calibration(
         os.path.join(fig_root, "08_final_overview"),
@@ -1832,8 +2718,48 @@ except Exception as exc:
 
 if WRITE_RESULTS and (not converged) and (not stagnated):
     dfsr_input_spectra_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", "spectraProfile")
-    LES._caseFiles.write_spectra_profile(hybrid_spectra_array, z_array, dfsr_input_spectra_path, clip_min=SPECTRUM_FLOOR_FOR_WRITE)
-    LES._caseFiles.write_new_dfsr_inlet_profile(new_inlet_profile_array, target_profile_df, case_path)
+    if INCLUDE_UW_COSPECTRAL_CALIBRATION and WRITE_LEGACY_3COMP_SPECTRA_BACKUP:
+        backup_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", "spectraProfile_legacy3comp")
+        write_spectra_profile_with_optional_uw(
+            hybrid_spectra_array,
+            z_array,
+            backup_path,
+            uw_stress=None,
+            cuw_array=None,
+            clip_min=SPECTRUM_FLOOR_FOR_WRITE,
+        )
+    if INCLUDE_UW_COSPECTRAL_CALIBRATION and WRITE_AUGMENTED_SPECTRA_PROFILE_WITH_UWSTRESS:
+        write_spectra_profile_with_optional_uw(
+            hybrid_spectra_array,
+            z_array,
+            dfsr_input_spectra_path,
+            uw_stress=final_uw_stress_resolved,
+            cuw_array=None,
+            clip_min=SPECTRUM_FLOOR_FOR_WRITE,
+        )
+    else:
+        write_spectra_profile_with_optional_uw(
+            hybrid_spectra_array,
+            z_array,
+            dfsr_input_spectra_path,
+            uw_stress=None,
+            cuw_array=None,
+            clip_min=SPECTRUM_FLOOR_FOR_WRITE,
+        )
+
+    if INCLUDE_UW_COSPECTRAL_CALIBRATION and WRITE_UW_COSPECTRA_PROFILE:
+        uw_output_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", SPECTRA_PROFILE_UW_FILENAME)
+        write_uw_cospectrum_profile(
+            hybrid_uw_cospectrum_array,
+            z_array,
+            final_uw_stress_resolved,
+            uw_output_path,
+        )
+
+    if INCLUDE_UW_COSPECTRAL_CALIBRATION:
+        write_new_dfsr_inlet_profile_with_uw(new_inlet_profile_array, target_profile_df, case_path, uw_stress=final_uw_stress_resolved)
+    else:
+        LES._caseFiles.write_new_dfsr_inlet_profile(new_inlet_profile_array, target_profile_df, case_path)
 
 if WRITE_ITER_SPECTRA:
     LES._caseFiles.write_dfsr_iter_spectra(
@@ -1848,6 +2774,14 @@ if WRITE_ITER_SPECTRA:
         cutoff_freqs=None,
         clip_min=SPECTRUM_FLOOR_FOR_WRITE,
     )
+    if INCLUDE_UW_COSPECTRAL_CALIBRATION:
+        iter_dir = os.path.join(case_path, "log", "downstreamCalibration", f"iteration{iteration}")
+        safe_makedirs(iter_dir)
+        write_uw_cospectrum_profile(inlet_uw_cospectrum_array, z_array, inlet_uw_stress_profile, os.path.join(iter_dir, "inletUWCoSpectrumProfile"))
+        write_uw_cospectrum_profile(downstream_uw_cospectrum_smoothed_array, z_array, downstream_uw_stress_time_series, os.path.join(iter_dir, "downstreamUWCoSpectrumProfile"))
+        write_uw_cospectrum_profile(target_uw_cospectrum_array, z_array, target_uw_stress_profile, os.path.join(iter_dir, "targetUWCoSpectrumProfile"))
+        if not converged and not stagnated:
+            write_uw_cospectrum_profile(hybrid_uw_cospectrum_array, z_array, final_uw_stress_resolved, os.path.join(iter_dir, "newInletUWCoSpectrumProfile"))
 
 
 #%% --------------------------------------------------------------------------

@@ -16,11 +16,17 @@ building = pv.read(building_stl_path)
 
 
 target_time = 51.70467
-q_values = [50,100,250,500,1000,2500,5000, 10000, 25000, 50000]
+#q_values = [50,100,250,500,1000,2500,5000, 10000, 25000, 50000]
+q_values = [500,1000,2500,5000, 10000, 25000, 50000]
+#clip_bounds = (
+#    -1.0, 5.0,   # x min, x max
+#     0.0, 3.0,   # y min, y max
+#     0.0, 1.5    # z min, z max
+#)
 
 clip_bounds = (
-    -1.0, 5.0,   # x min, x max
-     0.0, 3.0,   # y min, y max
+     2, 3,   # x min, x max
+     -0.5, 1,   # y min, y max
      0.0, 1.5    # z min, z max
 )
 
@@ -255,9 +261,15 @@ for q_val in q_values:
         #color="black"
     #)
     
+    #plotter.camera_position = [
+       # (-1.5, -3, 2),   # camera: upstream/inlet side, slightly elevated
+      #  (1.25, 0, 0.5),    # focal point: building / near wake
+     #   (0, 0, 1)            # z-up
+    #]
+    
     plotter.camera_position = [
-        (-1.5, -3, 2),   # camera: upstream/inlet side, slightly elevated
-        (1.25, 0, 0.5),    # focal point: building / near wake
+        (0.5, -2, 0.5),   # camera: upstream/inlet side, slightly elevated
+        (2.5, 0, 0.25),    # focal point: building / near wake
         (0, 0, 1)            # z-up
     ]
     
