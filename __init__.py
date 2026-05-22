@@ -3,7 +3,7 @@ __version__ = '0.0.1'
 from windlespy import _caseFiles
 from windlespy import _profileAnalysis
 from windlespy import _profileCalibration
-from windlespy import _aerodynamicForces
+#from windlespy import _aerodynamicForces
 from windlespy import _plot
 from windlespy import _windTunnel
 import os

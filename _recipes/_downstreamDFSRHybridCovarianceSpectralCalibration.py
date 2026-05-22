@@ -1439,8 +1439,20 @@ def write_uw_cospectrum_profile(cuw_array, z_array, uw_stress, output_path):
 
 
 def write_new_dfsr_inlet_profile_with_uw(new_inlet_profile_array, target_profile_df, case_path, uw_stress=None):
+    """
+    Write the standard 8-column DFSR profile only.
+
+    uwStress is deliberately not written to profile because several existing
+    windLespy profile readers expect exactly:
+        z U Iu Iv Iw Lu Lv Lw
+
+    The Reynolds shear stress is carried by spectraProfile and
+    uwCoSpectrumProfile instead.
+    """
     output_path = os.path.join(case_path, "constant", "boundaryData", "windProfile", "profile")
+
     arr = np.asarray(new_inlet_profile_array, dtype=float)
+
     df = pd.DataFrame({
         "z": target_profile_df["z"].to_numpy(dtype=float),
         "U": arr[:, 0],
@@ -1451,9 +1463,22 @@ def write_new_dfsr_inlet_profile_with_uw(new_inlet_profile_array, target_profile
         "Lv": arr[:, 5],
         "Lw": arr[:, 6],
     })
-    if uw_stress is not None:
-        df["uwStress"] = np.asarray(uw_stress, dtype=float)
+
     np.savetxt(_windows_long_path(output_path), df.to_numpy(), fmt="%.10e", delimiter="\t")
+
+    if uw_stress is not None:
+        diag_path = os.path.join(
+            case_path,
+            "constant",
+            "boundaryData",
+            "windProfile",
+            "profileUWStress_diagnostic",
+        )
+        diag_df = pd.DataFrame({
+            "z": target_profile_df["z"].to_numpy(dtype=float),
+            "uwStress": np.asarray(uw_stress, dtype=float),
+        })
+        diag_df.to_csv(_windows_long_path(diag_path), sep="\t", index=False, float_format="%.10e")
 
 
 def kaimal_uw_cospectrum_shape(freq_array, z_array, U_array, floor=1e-30):
@@ -1619,6 +1644,58 @@ def get_downstream_uw_cospectrum_array(fMax, nFreq, vel_array_3d, time_step, tim
             binned[h] = (np.asarray(knot_dict.get("f_knots", []), dtype=float), np.asarray(knot_dict.get("C_knots", []), dtype=float))
     return C_fit_array, raw, binned
 
+def _smooth_1d_with_kernel(x, kernel_weights):
+    x = np.asarray(x, dtype=float)
+
+    if kernel_weights is None or len(kernel_weights) <= 1 or len(x) < 3:
+        return x.copy()
+
+    k = np.asarray(kernel_weights, dtype=float)
+    k = k / np.sum(k)
+
+    pad = len(k) // 2
+    x_pad = np.pad(x, pad_width=pad, mode="edge")
+    return np.convolve(x_pad, k, mode="valid")
+
+
+def _merge_duplicate_x(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+
+    if len(x) == 0:
+        return x, y
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    out_x = []
+    out_y = []
+
+    i = 0
+    while i < len(x):
+        j = i + 1
+        while j < len(x) and np.isclose(x[j], x[i], rtol=1e-10, atol=1e-12):
+            j += 1
+
+        out_x.append(np.mean(x[i:j]))
+
+        # Preserve sign and average magnitude in log-space where possible.
+        y_group = y[i:j]
+        sign = np.sign(np.nanmedian(y_group))
+        if sign == 0.0 or not np.isfinite(sign):
+            sign = 1.0
+
+        mag = np.maximum(np.abs(y_group), 1e-300)
+        out_y.append(sign * np.exp(np.nanmean(np.log(mag))))
+
+        i = j
+
+    return np.asarray(out_x), np.asarray(out_y)
 
 def smooth_cospectrum_height_kernel(z_array, C_array, kernel_weights=(1,2,1)):
     C = np.asarray(C_array, dtype=float).copy()
@@ -1752,17 +1829,17 @@ def build_join_matched_signed_cospectrum(freq_array, spectral_baseline_C, crossc
             low_mag = np.clip(low_mag, ratio_min * spec_mag, ratio_max * spec_mag)
             low_shift = -low_mag
         matched_low[h, :] = low_shift
-        low_knots_f, low_knots_C = get_autocorr_low_frequency_knots_explicit(
+        low_knots_f, low_knots_mag = get_autocorr_low_frequency_knots_explicit(
             freq_array=f,
             autocorr_spectrum_1d=-low_shift if UW_ENFORCE_NEGATIVE_COSPECTRUM else np.abs(low_shift),
             first_spectral_knot_freq=f_join,
-            n_knots=low_n_knots,
+            resolved_f_min=f_min_for_low,
+            n_low_knots=low_n_knots,
             max_fraction_of_first_knot=low_max_fraction_of_first_knot,
-            min_points_per_bin=HYBRID_LOW_FREQ_MIN_POINTS_PER_BIN,
             floor=floor,
-            f_min_for_low=f_min_for_low,
         )
-        low_knots_C = -np.maximum(low_knots_C, floor) if UW_ENFORCE_NEGATIVE_COSPECTRUM else low_knots_C
+        
+        low_knots_C = -np.maximum(low_knots_mag, floor) if UW_ENFORCE_NEGATIVE_COSPECTRUM else low_knots_mag
         f_spec_knots = np.asarray(spectral_knot_freqs[h], dtype=float)
         f_spec_knots = f_spec_knots[np.isfinite(f_spec_knots) & (f_spec_knots > 0.0)]
         if len(f_spec_knots) == 0:
@@ -1850,6 +1927,368 @@ def plot_uw_stress_profiles(fig_dir, z_array, body_height, inlet_uw, downstream_
     ax.legend()
     safe_savefig(fig, os.path.join(fig_dir, "uw_stress_profiles.png"))
     plt.close(fig)
+    
+def read_optional_profile_dataframe(path):
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path, sep=r"\s+", header=0)
+
+
+def profile_array_to_melaku_quantities(z_array, profile_array, H, U_H_ref=None, uw_stress=None):
+    """
+    Convert DFSR profile array:
+        U, R11, R22, R33, Lu, Lv, Lw
+
+    into plotting quantities:
+        U/UH, Iu, Iv, Iw, Lu/H, Lv/H, Lw/H, uwStress
+    """
+    z = np.asarray(z_array, dtype=float)
+    arr = np.asarray(profile_array, dtype=float)
+
+    U = arr[:, 0]
+    Iu = np.sqrt(np.maximum(arr[:, 1], 0.0)) / np.maximum(U, 1e-12)
+    Iv = np.sqrt(np.maximum(arr[:, 2], 0.0)) / np.maximum(U, 1e-12)
+    Iw = np.sqrt(np.maximum(arr[:, 3], 0.0)) / np.maximum(U, 1e-12)
+
+    if U_H_ref is None:
+        U_H_ref = np.interp(H, z, U)
+
+    q = {
+        "z": z,
+        "z_over_H": z / H,
+        "U_over_UH": U / max(abs(float(U_H_ref)), 1e-12),
+        "Iu": Iu,
+        "Iv": Iv,
+        "Iw": Iw,
+        "Lu_over_H": arr[:, 4] / H,
+        "Lv_over_H": arr[:, 5] / H,
+        "Lw_over_H": arr[:, 6] / H,
+    }
+
+    if uw_stress is not None:
+        q["uwStress"] = np.asarray(uw_stress, dtype=float)
+
+    return q
+
+
+def profile_df_to_melaku_quantities(df, H, U_H_ref=None):
+    """
+    Convert dataframe with:
+        z U Iu Iv Iw Lu Lv Lw uwStress
+    into plotting quantities.
+    """
+    if df is None:
+        return None
+
+    z = df["z"].to_numpy(dtype=float)
+    U = df["U"].to_numpy(dtype=float)
+
+    if U_H_ref is None:
+        U_H_ref = np.interp(H, z, U)
+
+    q = {
+        "z": z,
+        "z_over_H": z / H,
+        "U_over_UH": U / max(abs(float(U_H_ref)), 1e-12),
+        "Iu": df["Iu"].to_numpy(dtype=float),
+        "Iv": df["Iv"].to_numpy(dtype=float),
+        "Iw": df["Iw"].to_numpy(dtype=float),
+        "Lu_over_H": df["Lu"].to_numpy(dtype=float) / H,
+        "Lv_over_H": df["Lv"].to_numpy(dtype=float) / H,
+        "Lw_over_H": df["Lw"].to_numpy(dtype=float) / H,
+    }
+
+    if "uwStress" in df.columns:
+        q["uwStress"] = df["uwStress"].to_numpy(dtype=float)
+
+    return q
+
+
+def finite_auto_xlim(*arrays, pad_frac=0.08):
+    vals = []
+    for a in arrays:
+        if a is None:
+            continue
+        x = np.asarray(a, dtype=float)
+        vals.append(x[np.isfinite(x)])
+    if not vals:
+        return (-1.0, 1.0)
+
+    vals = np.concatenate(vals)
+    if len(vals) == 0:
+        return (-1.0, 1.0)
+
+    lo = float(np.nanmin(vals))
+    hi = float(np.nanmax(vals))
+
+    if np.isclose(lo, hi):
+        pad = max(abs(lo) * 0.1, 1e-6)
+        return (lo - pad, hi + pad)
+
+    pad = pad_frac * (hi - lo)
+    return (lo - pad, hi + pad)
+
+
+def plot_iteration_profiles_melaku_style_8panel(
+    fig_dir,
+    iteration,
+    experimental_q,
+    smoothed_target_q,
+    downstream_q,
+    new_inlet_q,
+    target_q=None,
+    H=1.0,
+):
+    """
+    Melaku-style 8-panel calibration profile plot.
+
+    Top row:
+        U/UH, Iu, Iv, Iw
+
+    Bottom row:
+        uwStress, Lu/H, Lv/H, Lw/H
+    """
+    safe_makedirs(fig_dir)
+
+    plt.rcParams.update({
+        "figure.facecolor": "#222b38",
+        "axes.facecolor": "#222b38",
+        "savefig.facecolor": "#222b38",
+        "axes.edgecolor": "#d5dce8",
+        "axes.labelcolor": "#d5dce8",
+        "xtick.color": "#d5dce8",
+        "ytick.color": "#d5dce8",
+        "text.color": "#d5dce8",
+        "font.family": "serif",
+        "mathtext.fontset": "cm",
+    })
+
+    colours = {
+        "bg": "#222b38",
+        "fg": "#d5dce8",
+        "grid": "#7d8795",
+        "exp_edge": "#d5dce8",
+        "exp_face": "none",
+        "smooth_target": "#f2c94c",
+        "mapped_target": "#9aa4b2",
+        "downstream": "#ff3b30",
+        "new_inlet": "#56ccf2",
+    }
+
+    axis_config = {
+        "U_over_UH": {
+            "xlim": (0.0, 1.5),
+            "xticks": [0.0, 0.5, 1.0, 1.5],
+            "xlabel": r"$U_{av}/U_H$",
+            "panel": "(a)",
+        },
+        "Iu": {
+            "xlim": (0.0, 0.3),
+            "xticks": [0.0, 0.1, 0.2, 0.3],
+            "xlabel": r"$I_u$",
+            "panel": "(b)",
+        },
+        "Iv": {
+            "xlim": (0.0, 0.3),
+            "xticks": [0.0, 0.1, 0.2, 0.3],
+            "xlabel": r"$I_v$",
+            "panel": "(c)",
+        },
+        "Iw": {
+            "xlim": (0.0, 0.3),
+            "xticks": [0.0, 0.1, 0.2, 0.3],
+            "xlabel": r"$I_w$",
+            "panel": "(d)",
+        },
+        "uwStress": {
+            "xlim": None,
+            "xticks": None,
+            "xlabel": r"$\overline{u'w'}$",
+            "panel": "(e)",
+        },
+        "Lu_over_H": {
+            "xlim": (0.0, 4.0),
+            "xticks": [0.0, 1.0, 2.0, 3.0, 4.0],
+            "xlabel": r"$L_u/H$",
+            "panel": "(f)",
+        },
+        "Lv_over_H": {
+            "xlim": (0.0, 2.0),
+            "xticks": [0.0, 0.5, 1.0, 1.5, 2.0],
+            "xlabel": r"$L_v/H$",
+            "panel": "(g)",
+        },
+        "Lw_over_H": {
+            "xlim": (0.0, 2.0),
+            "xticks": [0.0, 0.5, 1.0, 1.5, 2.0],
+            "xlabel": r"$L_w/H$",
+            "panel": "(h)",
+        },
+    }
+
+    panel_w = 2.05
+    panel_h = 2.85
+    gap_x = 0.50
+    gap_y = 0.58
+    left_margin = 0.70
+    right_margin = 0.25
+    bottom_margin = 0.70
+    top_margin = 0.62
+    title_extra = 0.18
+
+    fig_w = left_margin + 4 * panel_w + 3 * gap_x + right_margin
+    fig_h = bottom_margin + 2 * panel_h + gap_y + top_margin + title_extra
+
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=False)
+    fig.patch.set_facecolor(colours["bg"])
+
+    def rect_in(x, y, w=panel_w, h=panel_h):
+        return [x / fig_w, y / fig_h, w / fig_w, h / fig_h]
+
+    y_bottom = bottom_margin
+    y_top = bottom_margin + panel_h + gap_y
+
+    x0 = left_margin
+    x1 = left_margin + panel_w + gap_x
+    x2 = x1 + panel_w + gap_x
+    x3 = x2 + panel_w + gap_x
+
+    layout = [
+        ("U_over_UH", x0, y_top),
+        ("Iu", x1, y_top),
+        ("Iv", x2, y_top),
+        ("Iw", x3, y_top),
+        ("uwStress", x0, y_bottom),
+        ("Lu_over_H", x1, y_bottom),
+        ("Lv_over_H", x2, y_bottom),
+        ("Lw_over_H", x3, y_bottom),
+    ]
+
+    axes = {key: fig.add_axes(rect_in(x, y)) for key, x, y in layout}
+
+    for key, ax in axes.items():
+        cfg = axis_config[key]
+
+        if experimental_q is not None and key in experimental_q:
+            ax.scatter(
+                experimental_q[key],
+                experimental_q["z_over_H"],
+                s=26,
+                facecolors=colours["exp_face"],
+                edgecolors=colours["exp_edge"],
+                linewidths=1.1,
+                label="EXP",
+                zorder=6,
+            )
+
+        if smoothed_target_q is not None and key in smoothed_target_q:
+            ax.plot(
+                smoothed_target_q[key],
+                smoothed_target_q["z_over_H"],
+                color=colours["smooth_target"],
+                linestyle="--",
+                linewidth=1.6,
+                label="Smoothed target",
+                zorder=5,
+            )
+
+        if target_q is not None and key in target_q:
+            ax.plot(
+                target_q[key],
+                target_q["z_over_H"],
+                color=colours["mapped_target"],
+                linestyle=":",
+                linewidth=1.3,
+                label="Mapped target",
+                zorder=4,
+            )
+
+        if downstream_q is not None and key in downstream_q:
+            ax.plot(
+                downstream_q[key],
+                downstream_q["z_over_H"],
+                color=colours["downstream"],
+                linestyle="-",
+                linewidth=1.9,
+                label="Downstream LES",
+                zorder=7,
+            )
+
+        if new_inlet_q is not None and key in new_inlet_q:
+            ax.plot(
+                new_inlet_q[key],
+                new_inlet_q["z_over_H"],
+                color=colours["new_inlet"],
+                linestyle="-",
+                linewidth=1.6,
+                label="New inlet",
+                zorder=8,
+            )
+
+        if cfg["xlim"] is not None:
+            ax.set_xlim(*cfg["xlim"])
+        else:
+            ax.set_xlim(
+                *finite_auto_xlim(
+                    experimental_q.get(key) if experimental_q is not None and key in experimental_q else None,
+                    smoothed_target_q.get(key) if smoothed_target_q is not None and key in smoothed_target_q else None,
+                    target_q.get(key) if target_q is not None and key in target_q else None,
+                    downstream_q.get(key) if downstream_q is not None and key in downstream_q else None,
+                    new_inlet_q.get(key) if new_inlet_q is not None and key in new_inlet_q else None,
+                )
+            )
+
+        if cfg["xticks"] is not None:
+            ax.set_xticks(cfg["xticks"])
+
+        ax.set_ylim(0.0, 3.0)
+        ax.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
+        ax.set_xlabel(cfg["xlabel"], fontsize=10)
+        ax.set_title(cfg["panel"], fontsize=11, pad=2)
+
+        if key in ("U_over_UH", "uwStress"):
+            ax.set_ylabel(r"$z/H$", fontsize=10)
+        else:
+            ax.set_ylabel("")
+
+        ax.tick_params(
+            axis="both",
+            which="both",
+            direction="in",
+            length=4.0,
+            width=0.8,
+            labelsize=8.5,
+            colors=colours["fg"],
+        )
+
+        ax.grid(True, which="major", linestyle="--", linewidth=0.50, alpha=0.35, color=colours["grid"])
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.85)
+            spine.set_color(colours["fg"])
+
+    axes["U_over_UH"].legend(
+        loc="upper left",
+        frameon=True,
+        facecolor=colours["bg"],
+        edgecolor=colours["fg"],
+        fontsize=8.5,
+        handlelength=1.8,
+        borderpad=0.45,
+        labelspacing=0.35,
+    )
+
+    fig.suptitle(
+        f"Downstream LES profile calibration — iteration {iteration}",
+        fontsize=13,
+        y=0.982,
+        color=colours["fg"],
+    )
+
+    out_path = os.path.join(fig_dir, f"iteration{iteration:02d}_profiles_melaku_style_8panel.png")
+    safe_savefig(fig, out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return out_path
 
 #%% --------------------------------------------------------------------------
 # Case setup and baseline downstream profile calculation
@@ -2668,6 +3107,75 @@ plot_length_profiles(
     components=COMPONENT_NAMES,
 )
 
+wind_profile_dir = os.path.join(case_path, "constant", "boundaryData", "windProfile")
+
+experimental_profile_path = os.path.join(wind_profile_dir, "targetExperimentalProfile")
+smoothed_target_profile_path = os.path.join(wind_profile_dir, "targetSmoothedProfile")
+
+experimental_profile_df = read_optional_profile_dataframe(experimental_profile_path)
+smoothed_target_profile_df = read_optional_profile_dataframe(smoothed_target_profile_path)
+
+# Reference velocity for U/UH. Prefer smoothed target, then mapped target.
+if smoothed_target_profile_df is not None:
+    U_H_ref_plot = np.interp(
+        building_height,
+        smoothed_target_profile_df["z"].to_numpy(dtype=float),
+        smoothed_target_profile_df["U"].to_numpy(dtype=float),
+    )
+else:
+    U_H_ref_plot = np.interp(
+        building_height,
+        z_array,
+        target_profile_array[:, 0],
+    )
+
+experimental_q = profile_df_to_melaku_quantities(
+    experimental_profile_df,
+    building_height,
+    U_H_ref=U_H_ref_plot,
+)
+
+smoothed_target_q = profile_df_to_melaku_quantities(
+    smoothed_target_profile_df,
+    building_height,
+    U_H_ref=U_H_ref_plot,
+)
+
+target_q = profile_array_to_melaku_quantities(
+    z_array,
+    target_profile_array,
+    building_height,
+    U_H_ref=U_H_ref_plot,
+    uw_stress=target_uw_stress_profile if INCLUDE_UW_COSPECTRAL_CALIBRATION else None,
+)
+
+downstream_q = profile_array_to_melaku_quantities(
+    z_array,
+    downstream_profile_array,
+    building_height,
+    U_H_ref=U_H_ref_plot,
+    uw_stress=downstream_uw_stress_time_series if INCLUDE_UW_COSPECTRAL_CALIBRATION else None,
+)
+
+new_inlet_q = profile_array_to_melaku_quantities(
+    z_array,
+    new_inlet_profile_array,
+    building_height,
+    U_H_ref=U_H_ref_plot,
+    uw_stress=final_uw_stress_resolved if INCLUDE_UW_COSPECTRAL_CALIBRATION else None,
+)
+
+plot_iteration_profiles_melaku_style_8panel(
+    fig_dir=os.path.join(fig_root, "08_profiles_melaku_8panel"),
+    iteration=iteration,
+    experimental_q=experimental_q,
+    smoothed_target_q=smoothed_target_q,
+    downstream_q=downstream_q,
+    new_inlet_q=new_inlet_q,
+    target_q=target_q,
+    H=building_height,
+)
+
 if INCLUDE_UW_COSPECTRAL_CALIBRATION:
     plot_uw_cospectra(
         os.path.join(fig_root, "09_uw_cospectra"),
@@ -2683,16 +3191,6 @@ if INCLUDE_UW_COSPECTRAL_CALIBRATION:
         building_height,
         z_max_factor=Z_MAX_FACTOR_FINAL_SPECTRA,
         n_heights=N_HEIGHTS_TO_PLOT,
-    )
-    plot_uw_stress_profiles(
-        os.path.join(fig_root, "10_uw_profiles"),
-        z_array,
-        building_height,
-        inlet_uw_stress_profile,
-        downstream_uw_stress_time_series,
-        target_uw_stress_profile,
-        updated_uw_stress_profile,
-        final_uw_stress_resolved,
     )
 
 try:
