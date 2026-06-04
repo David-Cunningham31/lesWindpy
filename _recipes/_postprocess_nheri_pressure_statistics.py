@@ -187,10 +187,37 @@ FACE_LABEL_BY_SURFACE = {
 # the coordinates themselves appear to align. These surfaces are mirrored in the
 # WT tap-coordinate table before nearest-neighbour mapping so Cp columns are paired
 # with the opposite horizontal coordinate on that face. Leave empty to disable.
-MIRROR_WT_MAPPING_SURFACES = {"4", "5"}
+MIRROR_WT_MAPPING_SURFACES = {"4"}
+
+
+# Layout/tap-number diagnostics.
+# The spreadsheet coordinates and the PDF drawings may encode the same tap labels
+# using different local face axes. In particular, Surfaces 2 and 3 are drawn with
+# the 600 mm face dimension as the vertical page direction, whereas the physical
+# building height is 500 mm. Therefore the PDF "vertical" direction on Surfaces 2
+# and 3 is NOT the physical z-axis.
+RUN_TAP_LAYOUT_DIAGNOSTICS = True
+
+# Hypothesis used for the actual LES-to-WT mapping in the main workflow.
+#   "excel_as_is"                 -> spreadsheet coordinates exactly as given
+#   "pdf_face_axes"               -> map tap row/col using the PDF face orientation
+#   "pdf_face_axes_flip_horizontal"
+#                                  -> same PDF face-axis interpretation, but reverse
+#                                     the PDF left-right direction on every face
+#   "pdf_face_axes_flip_vertical"
+#                                  -> same PDF face-axis interpretation, but reverse
+#                                     the PDF top-bottom direction on every face
+#   "pdf_face_axes_flip_both"     -> reverse both PDF directions
+LAYOUT_HYPOTHESIS = "excel_as_is"
+
+# Manual taps to print/check in diagnostics.
+MANUAL_CHECK_TAPS = [20106]
+
+# Faces for which the PDF face-axis interpretation is applied.
+PDF_FACE_AXIS_SURFACES = {"1", "2", "3", "4", "5"}
 
 # Output.
-OUT_DIR = CASE_DIR / "postProcessing_nheri_pressure_statistics_revised"
+OUT_DIR = CASE_DIR / "ppd"
 
 
 # =============================================================================
@@ -771,18 +798,392 @@ def read_tap_layout() -> pd.DataFrame:
     else:
         out["tap"] = np.nan
 
+    mat_id_col = detect_mat_id_column(df)
+    if mat_id_col is not None:
+        out["mat_id"] = pd.to_numeric(df[mat_id_col], errors="coerce")
+    else:
+        out["mat_id"] = np.nan
+
     out["surface"] = out["surface"].astype(str).str.strip()
     out = out.dropna(subset=["x_wt_raw", "y_wt_raw", "z_wt_raw"]).copy()
 
     return out
 
 
+
+
+def detect_mat_id_column(df: pd.DataFrame) -> Optional[str]:
+    return detect_column(
+        df,
+        [
+            "ID (.mat file) - DesignSafe",
+            "ID (.mat file)",
+            "mat_id",
+            "MatID",
+            "DesignSafeID",
+            "IDmat",
+        ],
+        required=False,
+    )
+
+
+def tap_row_col_from_label(tap_value) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return (surface, row, col) from a 5-digit NHERI tap label abcde."""
+    try:
+        s = f"{int(float(tap_value)):05d}"
+    except Exception:
+        return None, None, None
+    if len(s) != 5:
+        return None, None, None
+    return int(s[0]), int(s[1:3]), int(s[3:5])
+
+
+def enrich_layout_with_tap_indices(layout: pd.DataFrame) -> pd.DataFrame:
+    out = layout.copy()
+    parsed = out["tap"].apply(tap_row_col_from_label)
+    out["tap_surface_digit"] = [p[0] for p in parsed]
+    out["tap_row"] = [p[1] for p in parsed]
+    out["tap_col"] = [p[2] for p in parsed]
+    return out
+
+
+
+def _face_axes_from_pdf_orientation(face: pd.DataFrame) -> Tuple[str, str, str]:
+    """Return (horizontal_axis, vertical_axis, constant_axis) for PDF-based mapping.
+
+    The PDF drawings define a page-horizontal and page-vertical direction which is
+    not always the same as the physical x/y/z directions in the spreadsheet:
+      * Surfaces 1, 4, 5: PDF vertical is physical z.
+      * Surfaces 2, 3: PDF vertical is the 600 mm plan dimension, not z.
+    """
+    surf = _surface_key_for_mapping(face["surface"].iloc[0])
+
+    coords = {
+        "x_wt_raw": pd.to_numeric(face["x_wt_raw"], errors="coerce").to_numpy(float),
+        "y_wt_raw": pd.to_numeric(face["y_wt_raw"], errors="coerce").to_numpy(float),
+        "z_wt_raw": pd.to_numeric(face["z_wt_raw"], errors="coerce").to_numpy(float),
+    }
+    ranges = {k: (np.nanmax(v) - np.nanmin(v)) if np.any(np.isfinite(v)) else 0.0 for k, v in coords.items()}
+    const_axis = min(ranges, key=ranges.get)
+    varying = [k for k in ["x_wt_raw", "y_wt_raw", "z_wt_raw"] if k != const_axis]
+
+    if "z_wt_raw" in varying:
+        non_z = [k for k in varying if k != "z_wt_raw"][0]
+    else:
+        non_z = varying[0]
+    if surf in {"2", "3"}:
+        vertical_axis = non_z
+        horizontal_axis = "z_wt_raw" if "z_wt_raw" in varying else [k for k in varying if k != non_z][0]
+    else:
+        vertical_axis = "z_wt_raw" if "z_wt_raw" in varying else max(varying, key=lambda c: ranges.get(c, 0.0))
+        horizontal_axis = [k for k in varying if k != vertical_axis][0]
+    return horizontal_axis, vertical_axis, const_axis
+
+
+def apply_layout_hypothesis(layout: pd.DataFrame, hypothesis: str, diag_dir: Optional[Path] = None) -> pd.DataFrame:
+    """Return a copy of the tap layout with coordinates according to a chosen hypothesis."""
+    if diag_dir is not None:
+        ensure_dir(diag_dir)
+    out = enrich_layout_with_tap_indices(layout.copy())
+    out["layout_hypothesis"] = hypothesis
+    out["x_wt_hyp"] = out["x_wt_raw"]
+    out["y_wt_hyp"] = out["y_wt_raw"]
+    out["z_wt_hyp"] = out["z_wt_raw"]
+
+    if hypothesis == "excel_as_is":
+        return out
+
+    valid = {
+        "pdf_face_axes",
+        "pdf_face_axes_flip_horizontal",
+        "pdf_face_axes_flip_vertical",
+        "pdf_face_axes_flip_both",
+    }
+    if hypothesis not in valid:
+        raise ValueError(f"Unknown layout hypothesis: {hypothesis}")
+
+    flip_h = hypothesis in {"pdf_face_axes_flip_horizontal", "pdf_face_axes_flip_both"}
+    flip_v = hypothesis in {"pdf_face_axes_flip_vertical", "pdf_face_axes_flip_both"}
+
+    surf_keys = out["surface"].map(_surface_key_for_mapping).astype(str)
+    pdf_surfaces = {str(s) for s in PDF_FACE_AXIS_SURFACES}
+
+    for surf in sorted(pdf_surfaces):
+        m = (surf_keys == surf).to_numpy()
+        if not np.any(m):
+            continue
+        face = out.loc[m].copy()
+        if face["tap_row"].isna().all() or face["tap_col"].isna().all():
+            continue
+
+        horizontal_axis, vertical_axis, const_axis = _face_axes_from_pdf_orientation(face)
+
+        h_levels = np.sort(pd.unique(pd.to_numeric(face[horizontal_axis], errors="coerce").dropna()))
+        v_levels = np.sort(pd.unique(pd.to_numeric(face[vertical_axis], errors="coerce").dropna()))
+        row_levels = np.sort(pd.unique(pd.to_numeric(face["tap_row"], errors="coerce").dropna()))
+        col_levels = np.sort(pd.unique(pd.to_numeric(face["tap_col"], errors="coerce").dropna()))
+
+        if len(h_levels) != len(col_levels) or len(v_levels) != len(row_levels):
+            warnings.warn(
+                f"Surface {surf}: cannot build PDF face-axis hypothesis cleanly because "
+                f"unique coordinate levels (h={len(h_levels)}, v={len(v_levels)}) do not match "
+                f"tap row/col levels (row={len(row_levels)}, col={len(col_levels)}). Keeping spreadsheet coordinates.",
+                RuntimeWarning,
+            )
+            continue
+
+        # PDF page convention:
+        #   - row index increases from top to bottom on the page
+        #   - col index increases from left to right on the page
+        v_target_levels = v_levels if flip_v else v_levels[::-1]
+        h_target_levels = h_levels[::-1] if flip_h else h_levels
+
+        row_to_v = {int(r): float(v) for r, v in zip(row_levels, v_target_levels)}
+        col_to_h = {int(c): float(h) for c, h in zip(col_levels, h_target_levels)}
+
+        out.loc[m, vertical_axis.replace("_raw", "_hyp")] = face["tap_row"].map(row_to_v).to_numpy(float)
+        out.loc[m, horizontal_axis.replace("_raw", "_hyp")] = face["tap_col"].map(col_to_h).to_numpy(float)
+
+        if diag_dir is not None:
+            diag = face[["tap", "surface", "x_wt_raw", "y_wt_raw", "z_wt_raw", "tap_row", "tap_col"]].copy()
+            diag["pdf_horizontal_axis"] = horizontal_axis
+            diag["pdf_vertical_axis"] = vertical_axis
+            diag["constant_axis"] = const_axis
+            diag["flip_horizontal"] = flip_h
+            diag["flip_vertical"] = flip_v
+            diag["x_wt_hyp"] = out.loc[m, "x_wt_hyp"].to_numpy(float)
+            diag["y_wt_hyp"] = out.loc[m, "y_wt_hyp"].to_numpy(float)
+            diag["z_wt_hyp"] = out.loc[m, "z_wt_hyp"].to_numpy(float)
+            safe_h = re.sub(r"[^A-Za-z0-9_.-]+", "_", hypothesis)
+            diag.to_csv(diag_dir / f"layout_hypothesis_{safe_h}_surface{surf}.csv", index=False)
+
+    return out
+def find_numeric_arrays_recursive(obj, prefix=""):
+    """Collect all numeric arrays from a nested MATLAB/scipy object."""
+    out = []
+    obj = unwrap_mat(obj)
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.extend(find_numeric_arrays_recursive(v, f"{prefix}.{k}" if prefix else str(k)))
+        return out
+
+    if hasattr(obj, "__dict__"):
+        for k, v in vars(obj).items():
+            if not k.startswith("_"):
+                out.extend(find_numeric_arrays_recursive(v, f"{prefix}.{k}" if prefix else str(k)))
+        return out
+
+    arr = np.asarray(obj)
+    if arr.dtype.names:
+        for n in arr.dtype.names:
+            out.extend(find_numeric_arrays_recursive(arr[n], f"{prefix}.{n}" if prefix else str(n)))
+        return out
+
+    if np.issubdtype(arr.dtype, np.number):
+        out.append((prefix, np.asarray(arr)))
+    return out
+
+
+def write_mat_inventory_and_candidates(raw: Dict, scan, n_cp_cols: int, diag_dir: Path) -> pd.DataFrame:
+    """Inventory numeric arrays in the MAT file and write coordinate/ID candidates."""
+    rows = []
+    all_arrays = find_numeric_arrays_recursive({"MAT_ROOT": raw, "ScanivalveOnly": scan})
+    seen = set()
+    for name, arr in all_arrays:
+        key = (name, arr.shape, str(arr.dtype))
+        if key in seen:
+            continue
+        seen.add(key)
+        if arr.size == 0:
+            continue
+        rows.append({
+            "name": name,
+            "shape": tuple(arr.shape),
+            "dtype": str(arr.dtype),
+            "size": int(arr.size),
+            "min": float(np.nanmin(arr)) if np.issubdtype(arr.dtype, np.number) else np.nan,
+            "max": float(np.nanmax(arr)) if np.issubdtype(arr.dtype, np.number) else np.nan,
+            "is_len_ncp": bool(arr.ndim == 1 and arr.shape[0] == n_cp_cols),
+            "is_coord_triplet_rows": bool(arr.ndim == 2 and arr.shape == (n_cp_cols, 3)),
+            "is_coord_triplet_cols": bool(arr.ndim == 2 and arr.shape == (3, n_cp_cols)),
+        })
+    inv = pd.DataFrame(rows).sort_values(["size", "name"], ascending=[False, True])
+    inv.to_csv(diag_dir / "mat_numeric_array_inventory.csv", index=False)
+
+    candidate_rows = []
+    for _, r in inv.iterrows():
+        nm = str(r["name"]).lower()
+        score = 0
+        if "coord" in nm or "location" in nm or "pos" in nm or re.search(r"(^|[._])(x|y|z)($|[._])", nm):
+            score += 3
+        if "tap" in nm or "channel" in nm or "id" in nm:
+            score += 2
+        if r["is_coord_triplet_rows"] or r["is_coord_triplet_cols"]:
+            score += 5
+        if r["is_len_ncp"]:
+            score += 2
+        candidate_rows.append({**r.to_dict(), "candidate_score": score})
+    cand = pd.DataFrame(candidate_rows).sort_values(["candidate_score", "size", "name"], ascending=[False, False, True])
+    cand.to_csv(diag_dir / "mat_coordinate_id_candidates.csv", index=False)
+    return cand
+
+
+def compare_layout_hypotheses_against_mat(layout: pd.DataFrame, raw: Dict, scan, n_cp_cols: int, diag_dir: Path) -> pd.DataFrame:
+    """If coordinate-like arrays exist in the MAT file, compare them to alternative layout hypotheses."""
+    cand = write_mat_inventory_and_candidates(raw, scan, n_cp_cols, diag_dir)
+    hypotheses = [
+        apply_layout_hypothesis(layout, "excel_as_is", diag_dir),
+        apply_layout_hypothesis(layout, "pdf_face_axes", diag_dir),
+        apply_layout_hypothesis(layout, "pdf_face_axes_flip_horizontal", diag_dir),
+        apply_layout_hypothesis(layout, "pdf_face_axes_flip_vertical", diag_dir),
+        apply_layout_hypothesis(layout, "pdf_face_axes_flip_both", diag_dir),
+    ]
+
+    results = []
+    arrays = {name: arr for name, arr in find_numeric_arrays_recursive({"MAT_ROOT": raw, "ScanivalveOnly": scan})}
+    for _, crow in cand.iterrows():
+        name = crow["name"]
+        arr = np.asarray(arrays.get(name))
+        if arr.size == 0:
+            continue
+
+        coord_df = None
+        name_lower = str(name).lower()
+        if arr.ndim == 2 and arr.shape == (n_cp_cols, 3):
+            coord_df = pd.DataFrame(arr, columns=["x_mat", "y_mat", "z_mat"])
+        elif arr.ndim == 2 and arr.shape == (3, n_cp_cols):
+            coord_df = pd.DataFrame(arr.T, columns=["x_mat", "y_mat", "z_mat"])
+        else:
+            # Try to assemble x/y/z from individual 1-D arrays with matching prefixes.
+            continue
+
+        for hyp in hypotheses:
+            cmp = hyp.copy()
+            cmp = cmp.iloc[:min(len(cmp), len(coord_df))].copy().reset_index(drop=True)
+            cdf = coord_df.iloc[:len(cmp)].copy().reset_index(drop=True)
+            dif = cmp[["x_wt_hyp", "y_wt_hyp", "z_wt_hyp"]].to_numpy(float) - cdf[["x_mat", "y_mat", "z_mat"]].to_numpy(float)
+            rmse = float(np.sqrt(np.nanmean(dif ** 2)))
+            results.append({
+                "mat_array": name,
+                "hypothesis": cmp["layout_hypothesis"].iloc[0],
+                "rmse_raw_units": rmse,
+            })
+
+    out = pd.DataFrame(results)
+    if not out.empty:
+        out = out.sort_values(["mat_array", "rmse_raw_units", "hypothesis"])
+        out.to_csv(diag_dir / "layout_hypothesis_vs_mat_coordinate_candidates.csv", index=False)
+    return out
+
+
+
+def write_tap_layout_diagnostics(
+    layout: pd.DataFrame,
+    les_stats: pd.DataFrame,
+    files: Sequence[Path],
+    first_wt: "WTData",
+    diag_dir: Path,
+) -> None:
+    """Run diagnostics to compare spreadsheet vs PDF-based coordinate hypotheses."""
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    layout_idx = enrich_layout_with_tap_indices(layout.copy())
+    layout_idx.to_csv(diag_dir / "tap_layout_with_row_col_indices.csv", index=False)
+
+    hypothesis_names = [
+        "excel_as_is",
+        "pdf_face_axes",
+        "pdf_face_axes_flip_horizontal",
+        "pdf_face_axes_flip_vertical",
+        "pdf_face_axes_flip_both",
+    ]
+
+    # Manual taps of interest.
+    if MANUAL_CHECK_TAPS:
+        rows = []
+        for hyp_name in hypothesis_names:
+            hyp = apply_layout_hypothesis(layout_idx, hyp_name, diag_dir)
+            sub = hyp[hyp["tap"].isin(MANUAL_CHECK_TAPS)].copy()
+            sub["hypothesis"] = hyp_name
+            rows.append(
+                sub[
+                    [
+                        "tap", "surface", "tap_row", "tap_col",
+                        "x_wt_raw", "y_wt_raw", "z_wt_raw",
+                        "x_wt_hyp", "y_wt_hyp", "z_wt_hyp",
+                        "hypothesis",
+                    ]
+                ]
+            )
+        if rows:
+            pd.concat(rows, ignore_index=True).to_csv(diag_dir / "manual_tap_checks.csv", index=False)
+
+    # Read raw MAT and scan for coordinate/id metadata.
+    raw = loadmat(first_wt.path, squeeze_me=True, struct_as_record=False)
+    scan = get_scanivalve_struct(raw, first_wt.path)
+    compare_layout_hypotheses_against_mat(layout_idx, raw, scan, first_wt.cp.shape[1], diag_dir)
+
+    # Aggregate WT statistics across all repetitions once.
+    wt_acc = init_stats_acc(first_wt.cp.shape[1])
+    used_first = False
+    for f in files:
+        wt = first_wt if (not used_first and f == first_wt.path) else read_scanivalve_cp_file(f)
+        if f == first_wt.path:
+            used_first = True
+        update_stats_acc(wt_acc, wt.cp)
+    wt_stats_all_cols = finalize_stats_acc(wt_acc)
+
+    summary_rows = []
+    for hyp_name in hypothesis_names:
+        hyp_diag_dir = ensure_dir(diag_dir / _halias(hyp_name))
+        hyp = apply_layout_hypothesis(layout_idx, hyp_name, hyp_diag_dir)
+        layout_valid = prepare_layout_for_cp_columns(hyp, n_cp_cols=first_wt.cp.shape[1], diag_dir=hyp_diag_dir)
+        mapping = build_les_to_wt_mapping(les_stats, layout_valid, diag_dir=hyp_diag_dir)
+        mapping = mapping.dropna(subset=["cp_col"]).copy()
+        mapping["cp_col"] = mapping["cp_col"].astype(int)
+
+        cols = mapping["cp_col"].to_numpy(int)
+        wt_stats = wt_stats_all_cols.iloc[cols].reset_index(drop=True)
+        point = assemble_pointwise_comparison(les_stats, mapping, wt_stats, hyp_name)
+        metrics = metrics_from_pointwise(point, hyp_name)
+
+        point.to_csv(diag_dir / f"diagnostic_pointwise_{hyp_name}.csv", index=False)
+        metrics.to_csv(diag_dir / f"diagnostic_metrics_{hyp_name}.csv", index=False)
+
+        row = {
+            "hypothesis": hyp_name,
+            "n_points": int(len(point)),
+            "mapping_distance_min": float(mapping["distance"].min()),
+            "mapping_distance_median": float(mapping["distance"].median()),
+            "mapping_distance_max": float(mapping["distance"].max()),
+            "n_duplicate_cp_cols": int(mapping["cp_col"].duplicated(keep=False).sum()),
+        }
+        for stat in ["mean", "rms"]:
+            sub = metrics.loc[metrics["stat"] == stat]
+            if not sub.empty:
+                row[f"{stat}_rmse"] = float(sub["rmse"].iloc[0])
+                row[f"{stat}_mae"] = float(sub["mae"].iloc[0])
+                row[f"{stat}_corr"] = float(sub["corr"].iloc[0])
+                row[f"{stat}_bias"] = float(sub["bias_LES_minus_WT"].iloc[0])
+        # Lower score is better.
+        row["diagnostic_score"] = (
+            row.get("mean_rmse", np.nan)
+            + row.get("rms_rmse", np.nan)
+            + 0.05 * row["mapping_distance_median"]
+            + 0.25 * row["mapping_distance_max"]
+            + 0.02 * row["n_duplicate_cp_cols"]
+        )
+        summary_rows.append(row)
+
+    summary = pd.DataFrame(summary_rows).sort_values("diagnostic_score")
+    summary.to_csv(diag_dir / "layout_hypothesis_summary.csv", index=False)
 def prepare_layout_for_cp_columns(layout: pd.DataFrame, n_cp_cols: int, diag_dir: Path) -> pd.DataFrame:
     """
     Critical fix:
     Use row order of valid tap layout rows to assign Cp columns.
     Do not use tap labels as Python column indices.
     """
+    ensure_dir(diag_dir)
     out = layout.copy()
 
     # Remove explicitly invalid taps.
@@ -851,7 +1252,8 @@ def prepare_layout_for_cp_columns(layout: pd.DataFrame, n_cp_cols: int, diag_dir
 
 def maybe_scale_wt_coords(layout: pd.DataFrame, les_coords: np.ndarray) -> Tuple[pd.DataFrame, float, np.ndarray]:
     out = layout.copy()
-    wt_xyz_raw = out[["x_wt_raw", "y_wt_raw", "z_wt_raw"]].to_numpy(float)
+    src_cols = ["x_wt_hyp", "y_wt_hyp", "z_wt_hyp"] if all(c in out.columns for c in ["x_wt_hyp", "y_wt_hyp", "z_wt_hyp"]) else ["x_wt_raw", "y_wt_raw", "z_wt_raw"]
+    wt_xyz_raw = out[src_cols].to_numpy(float)
     les_xyz = np.asarray(les_coords, dtype=float)
 
     scale = 1.0
@@ -904,6 +1306,7 @@ def apply_wt_mapping_mirrors(layout_scaled: pd.DataFrame, diag_dir: Path) -> pd.
     the horizontal coordinate with the largest spread (x or y) and reflects it
     about the face midline. The z coordinate is never mirrored.
     """
+    ensure_dir(diag_dir)
     out = layout_scaled.copy()
     mirror_keys = {str(k) for k in MIRROR_WT_MAPPING_SURFACES}
     if not mirror_keys:
@@ -950,6 +1353,7 @@ def build_les_to_wt_mapping(
     Map each LES probe point to nearest WT tap coordinate.
     This uses coordinates for spatial matching and cp_col for Cp data indexing.
     """
+    ensure_dir(diag_dir)
     layout_scaled, scale, translation = maybe_scale_wt_coords(
         layout_valid,
         les_stats[["x_les", "y_les", "z_les"]].to_numpy(float),
@@ -1259,8 +1663,9 @@ def scatter_plot(point: pd.DataFrame, stat: str, label: str, out_dir: Path) -> N
     ax.legend(fontsize=8.5, loc="best", frameon=True)
 
     fig.tight_layout()
-    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
-    fig.savefig(out_dir / f"scatter_{stat}_{safe_label}.png", dpi=FIG_DPI)
+    comp = label.split(" [")[0]
+    hyp = label.split("[")[-1].rstrip("]") if "[" in label else ""
+    fig.savefig(out_dir / f"sc_{stat}_{_calias(comp)}_{_halias(hyp)}.png", dpi=FIG_DPI)
     plt.close(fig)
 
 
@@ -1443,7 +1848,9 @@ def contour_plots_all_faces(point: pd.DataFrame, stat: str, label: str, out_dir:
 
     fig.suptitle(f"{label} | {stat_label} contours, all non-roof faces", fontsize=14)
     safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
-    fig.savefig(out_dir / f"contours_all_faces_{stat}_{safe_label}.png", dpi=FIG_DPI)
+    comp = label.split(" [")[0]
+    hyp = label.split("[")[-1].rstrip("]") if "[" in label else ""
+    fig.savefig(out_dir / f"ct_all_{stat}_{_calias(comp)}_{_halias(hyp)}.png", dpi=FIG_DPI)
     plt.close(fig)
 
 
@@ -1518,7 +1925,9 @@ def contour_plots_by_face(point: pd.DataFrame, stat: str, label: str, out_dir: P
         fig.suptitle(f"{label} | {stat_label} contours | {row_label}", fontsize=14)
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
         safe_surf = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(surf_key))
-        fig.savefig(out_dir / f"contours_surface{safe_surf}_{stat}_{safe_label}.png", dpi=FIG_DPI)
+        comp = label.split(" [")[0]
+        hyp = label.split("[")[-1].rstrip("]") if "[" in label else ""
+        fig.savefig(out_dir / f"ct_s{safe_surf}_{stat}_{_calias(comp)}_{_halias(hyp)}.png", dpi=FIG_DPI)
         plt.close(fig)
 
 
@@ -1533,40 +1942,78 @@ def write_all_plots(point: pd.DataFrame, label: str, fig_dir: Path) -> None:
 # Main
 # =============================================================================
 
-def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ensure_dir(OUT_DIR)
-    csv_dir = ensure_dir(OUT_DIR / "csv")
-    fig_dir = ensure_dir(OUT_DIR / "figures")
-    diag_dir = ensure_dir(OUT_DIR / "diagnostics")
+ALL_LAYOUT_HYPOTHESES = [
+    "excel_as_is",
+    "pdf_face_axes",
+    "pdf_face_axes_flip_horizontal",
+    "pdf_face_axes_flip_vertical",
+    "pdf_face_axes_flip_both",
+]
 
-    les_stats, les_cp_df, ref_info, les_coords = read_les_pressure_and_reference()
+HYP_ALIAS = {
+    "excel_as_is": "excel",
+    "pdf_face_axes": "pdf",
+    "pdf_face_axes_flip_horizontal": "pdf_hf",
+    "pdf_face_axes_flip_vertical": "pdf_vf",
+    "pdf_face_axes_flip_both": "pdf_bf",
+}
 
-    # Save LES diagnostics.
-    les_stats.to_csv(csv_dir / "les_cp_statistics.csv", index=False)
+COMP_ALIAS = {
+    "WT_full_all_REP1-REP5": "fullall",
+    "WT_matchedDuration_all_REP1-REP5": "matchall",
+    "WT_full_REP1": "f_r1",
+    "WT_full_REP2": "f_r2",
+    "WT_full_REP3": "f_r3",
+    "WT_full_REP4": "f_r4",
+    "WT_full_REP5": "f_r5",
+    "WT_matchedDuration_REP1": "m_r1",
+    "WT_matchedDuration_REP2": "m_r2",
+    "WT_matchedDuration_REP3": "m_r3",
+    "WT_matchedDuration_REP4": "m_r4",
+    "WT_matchedDuration_REP5": "m_r5",
+}
+
+
+def _san(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s))
+
+def _halias(h: str) -> str:
+    return HYP_ALIAS.get(h, _san(h)[:12])
+
+def _calias(label: str) -> str:
+    return COMP_ALIAS.get(label, _san(label)[:16])
+
+
+def process_one_hypothesis(
+    hypothesis: str,
+    les_stats: pd.DataFrame,
+    ref_info: Dict[str, float],
+    first: WTData,
+    files: List[Path],
+    layout: pd.DataFrame,
+    base_out_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    hyp_out = ensure_dir(base_out_dir / _halias(hypothesis))
+    csv_dir = ensure_dir(hyp_out / "csv")
+    fig_dir = ensure_dir(hyp_out / "figures")
+    diag_dir = ensure_dir(hyp_out / "diagnostics")
+
     pd.DataFrame([ref_info]).to_csv(csv_dir / "les_upstream_reference.csv", index=False)
+    les_stats.to_csv(csv_dir / "les_cp_statistics.csv", index=False)
 
-    files = list_cp_files()
-
-    # Read first file to determine Cp column count and WT sampling rate.
-    first = read_scanivalve_cp_file(files[0])
-    n_cp_cols = first.cp.shape[1]
-    first_fs = first.fs
-
-    layout = read_tap_layout()
-    layout_valid = prepare_layout_for_cp_columns(layout, n_cp_cols=n_cp_cols, diag_dir=diag_dir)
+    layout_h = apply_layout_hypothesis(layout, hypothesis, diag_dir)
+    layout_valid = prepare_layout_for_cp_columns(layout_h, n_cp_cols=first.cp.shape[1], diag_dir=diag_dir)
     mapping = build_les_to_wt_mapping(les_stats, layout_valid, diag_dir=diag_dir)
-
-    # Drop any LES probes that could not be mapped.
     mapping = mapping.dropna(subset=["cp_col"]).copy()
     mapping["cp_col"] = mapping["cp_col"].astype(int)
     needed_cols = mapping["cp_col"].to_numpy(int)
 
-    if needed_cols.min() < 0 or needed_cols.max() >= n_cp_cols:
-        bad = mapping[(mapping["cp_col"] < 0) | (mapping["cp_col"] >= n_cp_cols)]
+    if needed_cols.min() < 0 or needed_cols.max() >= first.cp.shape[1]:
+        bad = mapping[(mapping["cp_col"] < 0) | (mapping["cp_col"] >= first.cp.shape[1])]
         bad.to_csv(diag_dir / "bad_mapping_rows_out_of_cp_range.csv", index=False)
         raise ValueError(
-            f"Mapping cp_col range {needed_cols.min()}..{needed_cols.max()} is outside "
-            f"Cp column range 0..{n_cp_cols - 1}. See diagnostics."
+            f"Hypothesis {hypothesis}: mapping cp_col range {needed_cols.min()}..{needed_cols.max()} is outside "
+            f"Cp column range 0..{first.cp.shape[1] - 1}."
         )
 
     mapping.to_csv(csv_dir / "les_to_wt_tap_mapping.csv", index=False)
@@ -1574,30 +2021,26 @@ def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
     all_points = []
     all_metrics = []
     meta_rows = []
-
     les_duration = ref_info["les_duration"]
 
-    # Helper that processes and writes one comparison.
     def process_comparison(label: str, cp_record: np.ndarray, fs: float):
-        print(f"Processing comparison: {label}  [samples={cp_record.shape[0]}, taps={cp_record.shape[1]}]")
         wt_stats = cp_stats_for_columns(cp_record, needed_cols)
         point = assemble_pointwise_comparison(les_stats, mapping, wt_stats, label)
+        point["layout_hypothesis"] = hypothesis
         metrics = metrics_from_pointwise(point, label)
+        metrics["layout_hypothesis"] = hypothesis
 
-        point.to_csv(csv_dir / f"pointwise_{re.sub(r'[^A-Za-z0-9_.-]+', '_', label)}.csv", index=False)
-        write_all_plots(point, label, fig_dir)
+        base_name = f"{_calias(label)}__{_halias(hypothesis)}"
+        point.to_csv(csv_dir / f"pointwise_{base_name}.csv", index=False)
+        write_all_plots(point, f"{label} [{hypothesis}]", fig_dir)
 
         all_points.append(point)
         all_metrics.append(metrics)
 
-    # Full all-repetition aggregate. This is now streaming/memory-safe: do not
-    # concatenate all five full records into one huge array.
-    print("Processing full WT record, all repetitions combined...")
+    print(f"\n=== Running hypothesis: {hypothesis} ===")
 
     full_all_acc = init_stats_acc(len(needed_cols))
     matched_all_acc = init_stats_acc(len(needed_cols))
-
-    # Use already-loaded first file to avoid loading it twice.
     loaded_first_used = False
 
     for f in files:
@@ -1607,10 +2050,11 @@ def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
         else:
             wt = read_scanivalve_cp_file(f)
 
-        if wt.cp.shape[1] != n_cp_cols:
-            raise ValueError(f"{wt.path.name}: expected {n_cp_cols} Cp columns, found {wt.cp.shape[1]}.")
+        if wt.cp.shape[1] != first.cp.shape[1]:
+            raise ValueError(f"{wt.path.name}: expected {first.cp.shape[1]} Cp columns, found {wt.cp.shape[1]}.")
 
         meta_rows.append({
+            "layout_hypothesis": hypothesis,
             "file": wt.path.name,
             "rep": wt.rep_label,
             "samples": wt.cp.shape[0],
@@ -1627,26 +2071,27 @@ def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
     wt_meta.to_csv(csv_dir / "wind_tunnel_file_metadata.csv", index=False)
 
     label = "WT_full_all_REP1-REP5"
-    print(f"Processing comparison: {label}  [streamed all full records]")
     wt_stats = finalize_stats_acc(full_all_acc)
     point = assemble_pointwise_comparison(les_stats, mapping, wt_stats, label)
+    point["layout_hypothesis"] = hypothesis
     metrics = metrics_from_pointwise(point, label)
-    point.to_csv(csv_dir / "pointwise_WT_full_all_REP1-REP5.csv", index=False)
-    write_all_plots(point, label, fig_dir)
+    metrics["layout_hypothesis"] = hypothesis
+    point.to_csv(csv_dir / f"pointwise_{_calias(label)}__{_halias(hypothesis)}.csv", index=False)
+    write_all_plots(point, f"{label} [{hypothesis}]", fig_dir)
     all_points.append(point)
     all_metrics.append(metrics)
 
     label = "WT_matchedDuration_all_REP1-REP5"
-    print(f"Processing comparison: {label}  [streamed matched-duration records]")
     wt_stats = finalize_stats_acc(matched_all_acc)
     point = assemble_pointwise_comparison(les_stats, mapping, wt_stats, label)
+    point["layout_hypothesis"] = hypothesis
     metrics = metrics_from_pointwise(point, label)
-    point.to_csv(csv_dir / "pointwise_WT_matchedDuration_all_REP1-REP5.csv", index=False)
-    write_all_plots(point, label, fig_dir)
+    metrics["layout_hypothesis"] = hypothesis
+    point.to_csv(csv_dir / f"pointwise_{_calias(label)}__{_halias(hypothesis)}.csv", index=False)
+    write_all_plots(point, f"{label} [{hypothesis}]", fig_dir)
     all_points.append(point)
     all_metrics.append(metrics)
 
-    # Per repetition: full duration and LES-matched duration only. No moving averages.
     loaded_first_used = False
     for f in files:
         if not loaded_first_used and f == first.path:
@@ -1656,30 +2101,81 @@ def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
             wt = read_scanivalve_cp_file(f)
 
         rep = wt.rep_label
-
-        # Full WT repetition.
         process_comparison(f"WT_full_{rep}", wt.cp, wt.fs)
-
-        # Same-duration WT record as the LES window.
         matched = select_time_record(wt.cp, wt.fs, WT_MATCH_START_TIME, les_duration)
         process_comparison(f"WT_matchedDuration_{rep}", matched, wt.fs)
 
     metrics_df = pd.concat(all_metrics, ignore_index=True)
     point_df = pd.concat(all_points, ignore_index=True)
-
-    metrics_df.to_csv(csv_dir / "summary_metrics_all_comparisons.csv", index=False)
     point_df.to_csv(csv_dir / "pointwise_all_comparisons.csv", index=False)
+    metrics_df.to_csv(csv_dir / "summary_metrics_all_comparisons.csv", index=False)
+
+    dup_count = int(pd.read_csv(diag_dir / "diagnostic_duplicate_cp_columns_in_mapping.csv").shape[0]) if (diag_dir / "diagnostic_duplicate_cp_columns_in_mapping.csv").exists() else 0
+    largest = pd.read_csv(diag_dir / "diagnostic_largest_mapping_distances.csv") if (diag_dir / "diagnostic_largest_mapping_distances.csv").exists() else pd.DataFrame()
+    summary_rows = []
+    for stat in ["mean", "rms"]:
+        m = metrics_df.loc[metrics_df["stat"] == stat]
+        summary_rows.append({
+            "layout_hypothesis": hypothesis,
+            "stat": stat,
+            "n_points": int(m["n"].iloc[0]) if not m.empty else np.nan,
+            "bias_LES_minus_WT": float(m["bias_LES_minus_WT"].iloc[0]) if not m.empty else np.nan,
+            "mae": float(m["mae"].iloc[0]) if not m.empty else np.nan,
+            "rmse": float(m["rmse"].iloc[0]) if not m.empty else np.nan,
+            "corr": float(m["corr"].iloc[0]) if not m.empty else np.nan,
+            "mapping_distance_min": float(mapping["distance"].min()),
+            "mapping_distance_median": float(mapping["distance"].median()),
+            "mapping_distance_max": float(mapping["distance"].max()),
+            "duplicate_mapping_rows": dup_count,
+        })
+    hyp_summary = pd.DataFrame(summary_rows)
+    hyp_summary.to_csv(diag_dir / "layout_hypothesis_metrics_summary.csv", index=False)
+    return metrics_df, point_df, hyp_summary
+
+
+def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ensure_dir(OUT_DIR)
+    base_hyp_dir = ensure_dir(OUT_DIR / "layout_hypotheses")
+    root_csv_dir = ensure_dir(OUT_DIR / "csv")
+    root_diag_dir = ensure_dir(OUT_DIR / "diagnostics")
+
+    les_stats, les_cp_df, ref_info, les_coords = read_les_pressure_and_reference()
+    root_les_stats = les_stats.copy()
+    root_les_stats.to_csv(root_csv_dir / "les_cp_statistics.csv", index=False)
+    pd.DataFrame([ref_info]).to_csv(root_csv_dir / "les_upstream_reference.csv", index=False)
+
+    files = list_cp_files()
+    first = read_scanivalve_cp_file(files[0])
+    layout = read_tap_layout()
+
+    if RUN_TAP_LAYOUT_DIAGNOSTICS:
+        write_tap_layout_diagnostics(layout, les_stats, files, first, root_diag_dir)
+
+    all_metrics = []
+    all_points = []
+    all_hyp_summaries = []
+
+    for hyp in ALL_LAYOUT_HYPOTHESES:
+        metrics_df, point_df, hyp_summary = process_one_hypothesis(
+            hyp, les_stats, ref_info, first, files, layout, base_hyp_dir
+        )
+        all_metrics.append(metrics_df)
+        all_points.append(point_df)
+        all_hyp_summaries.append(hyp_summary)
+
+    metrics_all = pd.concat(all_metrics, ignore_index=True)
+    points_all = pd.concat(all_points, ignore_index=True)
+    hyp_summary_all = pd.concat(all_hyp_summaries, ignore_index=True)
+
+    metrics_all.to_csv(root_csv_dir / "summary_metrics_all_hypotheses_all_comparisons.csv", index=False)
+    points_all.to_csv(root_csv_dir / "pointwise_all_hypotheses_all_comparisons.csv", index=False)
+    hyp_summary_all.to_csv(root_diag_dir / "layout_hypothesis_summary.csv", index=False)
 
     print("\nDone.")
     print(f"Outputs written to: {OUT_DIR}")
-    print(f"Diagnostics written to: {diag_dir}")
-    print("Most important diagnostic files:")
-    print(f"  {diag_dir / 'tap_layout_valid_with_assigned_cp_columns.csv'}")
-    print(f"  {diag_dir / 'les_to_wt_tap_mapping.csv'}")
-    print(f"  {diag_dir / 'diagnostic_largest_mapping_distances.csv'}")
-    print(f"  {csv_dir / 'summary_metrics_all_comparisons.csv'}")
-
-    return metrics_df, point_df
+    print(f"Per-hypothesis outputs written under: {base_hyp_dir}")
+    print(f"Overall hypothesis summary: {root_diag_dir / 'layout_hypothesis_summary.csv'}")
+    return metrics_all, points_all
 
 
 if __name__ == "__main__":

@@ -83,9 +83,9 @@ WRITE_RESULTS = True
 WRITE_ITER_SPECTRA = True
 
 MEAN_PROFILE_RELAXATION_FACTOR = 0.5
-SPECTRAL_RELAXATION_FACTOR = 0.35
-AUTOCORR_RELAXATION_FACTOR = 0.35
-VARIANCE_RELAXATION_FACTOR = 0.35
+SPECTRAL_RELAXATION_FACTOR = 0.5
+AUTOCORR_RELAXATION_FACTOR = 0.5
+VARIANCE_RELAXATION_FACTOR = 0.5
 
 # Downstream variance used in the resolved-band Wong variance update.
 # "spectra_smoothed" is most consistent with the spectral update; "time_series"
@@ -1223,6 +1223,258 @@ def plot_length_profiles(fig_dir, z_array, body_height, L_inlet, L_downstream, L
         safe_savefig(fig, os.path.join(fig_dir, f"L_{comp}.png"))
         plt.close(fig)
 
+def read_optional_profile_dataframe(path):
+    """Read optional diagnostic profile with a header row; return None if absent."""
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_csv(path, sep=r"\s+", header=0)
+    except Exception as exc:
+        print(f"Warning: could not read optional profile {path}: {exc}")
+        return None
+
+
+def _profile_df_column(df, names):
+    if df is None:
+        return None
+    lookup = {str(c).strip().lower().replace("_", ""): c for c in df.columns}
+    for name in names:
+        key = str(name).strip().lower().replace("_", "")
+        if key in lookup:
+            return lookup[key]
+    return None
+
+
+def profile_array_to_profile_quantities(z_array, profile_array, H, U_H_ref=None, stores_variances=True):
+    """Convert windLespy profile arrays to plotting quantities.
+
+    Parameters
+    ----------
+    profile_array : array
+        Expected windLespy internal format [U, R11, R22, R33, Lu, Lv, Lw]
+        when stores_variances=True, or [U, Iu, Iv, Iw, Lu, Lv, Lw] when false.
+    """
+    z = np.asarray(z_array, dtype=float)
+    arr = np.asarray(profile_array, dtype=float)
+    U = arr[:, 0]
+    if stores_variances:
+        Iu = np.sqrt(np.maximum(arr[:, 1], 0.0)) / np.maximum(np.abs(U), 1e-12)
+        Iv = np.sqrt(np.maximum(arr[:, 2], 0.0)) / np.maximum(np.abs(U), 1e-12)
+        Iw = np.sqrt(np.maximum(arr[:, 3], 0.0)) / np.maximum(np.abs(U), 1e-12)
+    else:
+        Iu, Iv, Iw = arr[:, 1], arr[:, 2], arr[:, 3]
+    if U_H_ref is None:
+        U_H_ref = np.interp(H, z, U)
+    U_H_ref = max(abs(float(U_H_ref)), 1e-12)
+    return {
+        "z": z,
+        "z_over_H": z / H,
+        "U_over_UH": U / U_H_ref,
+        "Iu": Iu,
+        "Iv": Iv,
+        "Iw": Iw,
+        "Lu_over_H": arr[:, 4] / H,
+        "Lv_over_H": arr[:, 5] / H,
+        "Lw_over_H": arr[:, 6] / H,
+    }
+
+
+def profile_df_to_profile_quantities(df, H, U_H_ref=None):
+    """Convert diagnostic profile dataframe to plotting quantities.
+
+    Expected columns are z, U, Iu, Iv, Iw, Lu, Lv, Lw. Missing columns return None.
+    """
+    if df is None:
+        return None
+    z_col = _profile_df_column(df, ["z", "Z", "height"])
+    U_col = _profile_df_column(df, ["U", "Uav", "U_av", "meanU", "Ux"])
+    Iu_col = _profile_df_column(df, ["Iu", "I_u"])
+    Iv_col = _profile_df_column(df, ["Iv", "I_v"])
+    Iw_col = _profile_df_column(df, ["Iw", "I_w"])
+    Lu_col = _profile_df_column(df, ["Lu", "L_u"])
+    Lv_col = _profile_df_column(df, ["Lv", "L_v"])
+    Lw_col = _profile_df_column(df, ["Lw", "L_w"])
+    required = [z_col, U_col, Iu_col, Iv_col, Iw_col, Lu_col, Lv_col, Lw_col]
+    if any(c is None for c in required):
+        print(f"Warning: optional diagnostic profile is missing required columns; found {list(df.columns)}")
+        return None
+    z = df[z_col].to_numpy(dtype=float)
+    U = df[U_col].to_numpy(dtype=float)
+    order = np.argsort(z)
+    z = z[order]
+    U = U[order]
+    if U_H_ref is None:
+        U_H_ref = np.interp(H, z, U)
+    U_H_ref = max(abs(float(U_H_ref)), 1e-12)
+    return {
+        "z": z,
+        "z_over_H": z / H,
+        "U_over_UH": U / U_H_ref,
+        "Iu": df[Iu_col].to_numpy(dtype=float)[order],
+        "Iv": df[Iv_col].to_numpy(dtype=float)[order],
+        "Iw": df[Iw_col].to_numpy(dtype=float)[order],
+        "Lu_over_H": df[Lu_col].to_numpy(dtype=float)[order] / H,
+        "Lv_over_H": df[Lv_col].to_numpy(dtype=float)[order] / H,
+        "Lw_over_H": df[Lw_col].to_numpy(dtype=float)[order] / H,
+    }
+
+
+def plot_downstream_profiles_melaku_style_7panel(
+    fig_dir,
+    iteration,
+    experimental_q,
+    smoothed_target_q,
+    downstream_q,
+    new_inlet_q,
+    target_q=None,
+    H=1.0,
+):
+    """Plot downstream profile overview in a Melaku-style layout.
+
+    This version omits Reynolds shear stress and uses a larger mean-velocity
+    panel spanning the full figure height on the left. The remaining six panels
+    show turbulence intensities and integral length scales.
+    """
+    safe_makedirs(fig_dir)
+
+    old_rc = plt.rcParams.copy()
+    plt.rcParams.update({
+        "figure.facecolor": "#222b38",
+        "axes.facecolor": "#222b38",
+        "savefig.facecolor": "#222b38",
+        "axes.edgecolor": "#d5dce8",
+        "axes.labelcolor": "#d5dce8",
+        "xtick.color": "#d5dce8",
+        "ytick.color": "#d5dce8",
+        "text.color": "#d5dce8",
+        "font.family": "serif",
+        "mathtext.fontset": "cm",
+    })
+
+    colours = {
+        "bg": "#222b38",
+        "fg": "#d5dce8",
+        "grid": "#7d8795",
+        "exp_edge": "#d5dce8",
+        "exp_face": "none",
+        "smooth_target": "#f2c94c",
+        "mapped_target": "#9aa4b2",
+        "downstream": "#ff3b30",
+        "new_inlet": "#56ccf2",
+    }
+
+    axis_config = {
+        "U_over_UH": {"xlim": (0.0, 1.5), "xticks": [0.0, 0.5, 1.0, 1.5], "xlabel": r"$U_{av}/U_H$", "panel": "(a)"},
+        "Iu": {"xlim": (0.0, 0.3), "xticks": [0.0, 0.1, 0.2, 0.3], "xlabel": r"$I_u$", "panel": "(b)"},
+        "Iv": {"xlim": (0.0, 0.3), "xticks": [0.0, 0.1, 0.2, 0.3], "xlabel": r"$I_v$", "panel": "(c)"},
+        "Iw": {"xlim": (0.0, 0.3), "xticks": [0.0, 0.1, 0.2, 0.3], "xlabel": r"$I_w$", "panel": "(d)"},
+        "Lu_over_H": {"xlim": (0.0, 4.0), "xticks": [0.0, 1.0, 2.0, 3.0, 4.0], "xlabel": r"$L_u/H$", "panel": "(e)"},
+        "Lv_over_H": {"xlim": (0.0, 2.0), "xticks": [0.0, 0.5, 1.0, 1.5, 2.0], "xlabel": r"$L_v/H$", "panel": "(f)"},
+        "Lw_over_H": {"xlim": (0.0, 2.0), "xticks": [0.0, 0.5, 1.0, 1.5, 2.0], "xlabel": r"$L_w/H$", "panel": "(g)"},
+    }
+
+    panel_w = 2.05
+    panel_h = 2.85
+    u_panel_w = 2.45
+    gap_x = 0.55
+    gap_y = 0.60
+    left_margin = 0.75
+    right_margin = 0.25
+    bottom_margin = 0.72
+    top_margin = 0.75
+    title_extra = 0.15
+
+    fig_w = left_margin + u_panel_w + gap_x + 3 * panel_w + 2 * gap_x + right_margin
+    fig_h = bottom_margin + 2 * panel_h + gap_y + top_margin + title_extra
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=False)
+    fig.patch.set_facecolor(colours["bg"])
+
+    def rect_in(x, y, w, h):
+        return [x / fig_w, y / fig_h, w / fig_w, h / fig_h]
+
+    y_bottom = bottom_margin
+    y_top = bottom_margin + panel_h + gap_y
+    x_u = left_margin
+    x1 = left_margin + u_panel_w + gap_x
+    x2 = x1 + panel_w + gap_x
+    x3 = x2 + panel_w + gap_x
+
+    axes = {
+        "U_over_UH": fig.add_axes(rect_in(x_u, y_bottom, u_panel_w, 2 * panel_h + gap_y)),
+        "Iu": fig.add_axes(rect_in(x1, y_top, panel_w, panel_h)),
+        "Iv": fig.add_axes(rect_in(x2, y_top, panel_w, panel_h)),
+        "Iw": fig.add_axes(rect_in(x3, y_top, panel_w, panel_h)),
+        "Lu_over_H": fig.add_axes(rect_in(x1, y_bottom, panel_w, panel_h)),
+        "Lv_over_H": fig.add_axes(rect_in(x2, y_bottom, panel_w, panel_h)),
+        "Lw_over_H": fig.add_axes(rect_in(x3, y_bottom, panel_w, panel_h)),
+    }
+
+    for key, ax in axes.items():
+        cfg = axis_config[key]
+        if experimental_q is not None and key in experimental_q:
+            ax.scatter(experimental_q[key], experimental_q["z_over_H"], s=26, facecolors=colours["exp_face"], edgecolors=colours["exp_edge"], linewidths=1.1, label="EXP", zorder=7)
+        if smoothed_target_q is not None and key in smoothed_target_q:
+            ax.plot(smoothed_target_q[key], smoothed_target_q["z_over_H"], color=colours["smooth_target"], linestyle="--", linewidth=1.6, label="Smoothed target", zorder=5)
+        if target_q is not None and key in target_q:
+            ax.plot(target_q[key], target_q["z_over_H"], color=colours["mapped_target"], linestyle=":", linewidth=1.3, label="Mapped target", zorder=4)
+        if downstream_q is not None and key in downstream_q:
+            ax.plot(downstream_q[key], downstream_q["z_over_H"], color=colours["downstream"], linestyle="-", linewidth=1.9, label="Downstream LES", zorder=6)
+        if new_inlet_q is not None and key in new_inlet_q:
+            ax.plot(new_inlet_q[key], new_inlet_q["z_over_H"], color=colours["new_inlet"], linestyle="-.", linewidth=1.5, label="Updated inlet", zorder=5)
+
+        ax.set_xlim(*cfg["xlim"])
+        ax.set_xticks(cfg["xticks"])
+        ax.set_ylim(0.0, 3.0)
+        ax.set_yticks([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
+        ax.set_xlabel(cfg["xlabel"], fontsize=10)
+        ax.set_title(cfg["panel"], fontsize=11, pad=2)
+        if key in ("U_over_UH", "Iu", "Lu_over_H"):
+            ax.set_ylabel(r"$z/H$", fontsize=10)
+        else:
+            ax.set_ylabel("")
+        ax.tick_params(axis="both", which="both", direction="in", length=4.0, width=0.8, labelsize=8.5, colors=colours["fg"])
+        ax.grid(True, which="major", linestyle="--", linewidth=0.50, alpha=0.35, color=colours["grid"])
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.85)
+            spine.set_color(colours["fg"])
+
+    axes["U_over_UH"].legend(loc="upper left", frameon=True, facecolor=colours["bg"], edgecolor=colours["fg"], fontsize=8.5, handlelength=1.8, borderpad=0.45, labelspacing=0.35)
+    fig.suptitle(f"Downstream profile calibration overview — iteration {iteration}", fontsize=13, y=0.985, color=colours["fg"])
+
+    png_path = os.path.join(fig_dir, f"iteration{int(iteration):02d}_downstream_profiles_melaku_style_7panel.png")
+    safe_savefig(fig, png_path, dpi=300)
+    plt.close(fig)
+    plt.rcParams.update(old_rc)
+    return png_path
+
+
+def write_profile_overview_plot(case_path, fig_root, iteration, z_array, building_height, target_profile_df, target_profile_array, downstream_profile_array, new_inlet_profile_array):
+    """Create Melaku-style downstream profile figure using optional diagnostic profiles."""
+    wind_profile_dir = os.path.join(case_path, "constant", "boundaryData", "windProfile")
+    exp_df = read_optional_profile_dataframe(os.path.join(wind_profile_dir, "targetExperimentalProfile"))
+    smooth_df = read_optional_profile_dataframe(os.path.join(wind_profile_dir, "targetSmoothedProfile"))
+
+    # Use the target-profile U at z=H for consistent normalisation across all curves.
+    U_H_ref = np.interp(building_height, z_array, target_profile_array[:, 0])
+
+    experimental_q = profile_df_to_profile_quantities(exp_df, building_height, U_H_ref=U_H_ref)
+    smoothed_q = profile_df_to_profile_quantities(smooth_df, building_height, U_H_ref=U_H_ref)
+    target_q = profile_array_to_profile_quantities(z_array, target_profile_array, building_height, U_H_ref=U_H_ref, stores_variances=True)
+    downstream_q = profile_array_to_profile_quantities(z_array, downstream_profile_array, building_height, U_H_ref=U_H_ref, stores_variances=True)
+    new_inlet_q = profile_array_to_profile_quantities(z_array, new_inlet_profile_array, building_height, U_H_ref=U_H_ref, stores_variances=True)
+
+    out_dir = os.path.join(fig_root, "08_final_overview", "profiles")
+    return plot_downstream_profiles_melaku_style_7panel(
+        out_dir,
+        iteration,
+        experimental_q,
+        smoothed_q,
+        downstream_q,
+        new_inlet_q,
+        target_q=target_q,
+        H=building_height,
+    )
+
 
 #%% --------------------------------------------------------------------------
 # Case setup and baseline downstream profile calculation
@@ -1807,6 +2059,22 @@ try:
     )
 except Exception as exc:
     print(f"Warning: final overview plot failed: {exc}")
+
+try:
+    profile_fig = write_profile_overview_plot(
+        case_path,
+        fig_root,
+        iteration,
+        z_array,
+        building_height,
+        target_profile_df,
+        target_profile_array,
+        downstream_profile_array,
+        new_inlet_profile_array,
+    )
+    print(f"Wrote downstream profile overview: {profile_fig}")
+except Exception as exc:
+    print(f"Warning: downstream profile overview plot failed: {exc}")
 
 
 #%% --------------------------------------------------------------------------
