@@ -64,7 +64,12 @@ WRITE_QA_CSV = True
 # Figure styling.
 FIG_DPI = 300
 SAVE_PDF = False
-DARK_STYLE = True
+DARK_STYLE = False
+
+# Animation output from the per-iteration profile PNGs.
+CREATE_ANIMATION = True
+ANIMATION_FPS = 2
+ANIMATION_FILENAME = "profile_iteration_progression.gif"
 
 # Marker/line styling similar to the paper.
 EXP_MARKER_SIZE = 26
@@ -410,11 +415,29 @@ def build_nheri_experimental_quantities(approach_flow_mat, H):
 
 
 def apply_plot_style():
+    """Return colours and set Matplotlib defaults.
+
+    DARK_STYLE=False gives a sharp white background for both the figure and
+    axes.  This is deliberately explicit so no dark rcParams survive from a
+    previous run in Spyder.
+    """
     if not DARK_STYLE:
+        plt.rcParams.update({
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "savefig.facecolor": "white",
+            "axes.edgecolor": "black",
+            "axes.labelcolor": "black",
+            "xtick.color": "black",
+            "ytick.color": "black",
+            "text.color": "black",
+            "font.family": "serif",
+            "mathtext.fontset": "cm",
+        })
         return {
             "bg": "white",
             "fg": "black",
-            "grid": "0.6",
+            "grid": "0.70",
             "exp_edge": "black",
             "exp_face": "none",
             "dfsr": "tab:purple",
@@ -443,6 +466,58 @@ def apply_plot_style():
         "les": "#ff3b30",
     }
 
+
+def create_iteration_animation(frame_paths, output_dir, filename=ANIMATION_FILENAME, fps=ANIMATION_FPS):
+    """Create a GIF animation from the per-iteration profile PNG files.
+
+    Frames are padded to a common size before writing. This prevents GIF
+    writing failures if bbox_inches='tight' creates PNGs that differ by a few
+    pixels between iterations.
+    """
+    frame_paths = [Path(p) for p in frame_paths if Path(p).exists()]
+    if not frame_paths:
+        warnings.warn("No frame PNGs available for animation.")
+        return None
+
+    out_path = Path(output_dir) / filename
+    duration_ms = int(round(1000.0 / max(float(fps), 1.0e-9)))
+
+    try:
+        from PIL import Image, ImageOps
+    except Exception as exc:
+        warnings.warn(f"Could not import PIL/Pillow; skipping animation: {exc}")
+        return None
+
+    frames = []
+    max_w = 0
+    max_h = 0
+
+    for path in frame_paths:
+        im = Image.open(path).convert("RGB")
+        frames.append(im)
+        max_w = max(max_w, im.width)
+        max_h = max(max_h, im.height)
+
+    padded_frames = []
+    bg = (255, 255, 255) if not DARK_STYLE else (34, 43, 56)
+
+    for im in frames:
+        canvas = Image.new("RGB", (max_w, max_h), bg)
+        x0 = (max_w - im.width) // 2
+        y0 = (max_h - im.height) // 2
+        canvas.paste(im, (x0, y0))
+        padded_frames.append(canvas)
+
+    padded_frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=padded_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=False,
+    )
+
+    return str(out_path)
 
 def plot_iteration_figure(iteration_number, exp_q, dfsr_q, les_q, output_dir):
     """Plot one iteration with a Melaku-like panel aspect and spacing.
@@ -681,8 +756,16 @@ def main():
         all_q = pd.concat([quantities_to_dataframe(exp_q, "EXP_NHERI", None)] + qa_rows, ignore_index=True)
         all_q.to_csv(os.path.join(output_dir, "all_plotted_profile_quantities.csv"), index=False)
 
+    animation_path = None
+    if CREATE_ANIMATION:
+        animation_path = create_iteration_animation(written, output_dir)
+        if animation_path is not None:
+            print(f"  wrote animation {animation_path}")
+
     print("\nDone.")
     print(f"Figures written: {len(written)}")
+    if animation_path is not None:
+        print(f"Animation written: {animation_path}")
     return written
 
 
