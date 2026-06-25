@@ -106,7 +106,26 @@ def get_dfsr_target_profile_df(case_path):
     
     target_profile_df=pd.read_csv(target_profile_path, sep=r"\s+", header=None)
     
-    columns=["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
+    n_cols = target_profile_df.shape[1]
+
+    if n_cols == 8:
+        columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
+    
+    elif n_cols == 9:
+        columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"]
+    
+    elif n_cols == 15:
+        columns = [
+            "z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw",
+            "uu", "vv", "ww", "uv", "uw", "vw", "uwStress"
+        ]
+    
+    else:
+        raise ValueError(
+            f"Unsupported targetProfile format: found {n_cols} columns. "
+            "Expected 8 classic DFSR columns, 9 co-spectral columns, or 15 extended columns."
+        )
+    
     target_profile_df.columns = columns
     
     return target_profile_df
@@ -126,16 +145,30 @@ def get_dfsr_target_profile_array(case_path):
     
     target_profile_df=pd.read_csv(target_profile_path, sep=r"\s+", header=None)
     
-    columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
-    target_profile_df.columns = columns
+    if len(target_profile_df.columns)==8:
+        columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
+        target_profile_df.columns = columns
+        
+        target_profile_df["R_11"] = (target_profile_df["Iu"] * target_profile_df["U"])**2
+        target_profile_df["R_22"] = (target_profile_df["Iv"] * target_profile_df["U"])**2
+        target_profile_df["R_33"] = (target_profile_df["Iw"] * target_profile_df["U"])**2
+        
+        target_profile_df = target_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw"]]
     
-    target_profile_df["R_11"] = (target_profile_df["Iu"] * target_profile_df["U"])**2
-    target_profile_df["R_22"] = (target_profile_df["Iv"] * target_profile_df["U"])**2
-    target_profile_df["R_33"] = (target_profile_df["Iw"] * target_profile_df["U"])**2
+        target_profile_array = target_profile_df.to_numpy()
+        
+    if len(target_profile_df.columns)==9:
+        
+        columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"]
+        target_profile_df.columns = columns
+        
+        target_profile_df["R_11"] = (target_profile_df["Iu"] * target_profile_df["U"])**2
+        target_profile_df["R_22"] = (target_profile_df["Iv"] * target_profile_df["U"])**2
+        target_profile_df["R_33"] = (target_profile_df["Iw"] * target_profile_df["U"])**2
+        
+        target_profile_df = target_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw", "uwStress"]]
     
-    target_profile_df = target_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw"]]
-
-    target_profile_array = target_profile_df.to_numpy()
+        target_profile_array = target_profile_df.to_numpy()
     
     return target_profile_array
 
@@ -149,16 +182,30 @@ def get_current_dfsr_inlet_profile_array(case_path):
     
     current_profile_df=pd.read_csv(current_profile_path, sep=r"\s+", header=None)
     
-    columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
-    current_profile_df.columns = columns
-
-    current_profile_df["R_11"] = (current_profile_df["Iu"] * current_profile_df["U"])**2
-    current_profile_df["R_22"] = (current_profile_df["Iv"] * current_profile_df["U"])**2
-    current_profile_df["R_33"] = (current_profile_df["Iw"] * current_profile_df["U"])**2
+    if len(current_profile_df.columns)==8:
+        columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw"]
+        current_profile_df.columns = columns
     
-    current_profile_df = current_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw"]]
-
-    current_profile_array = current_profile_df.to_numpy()
+        current_profile_df["R_11"] = (current_profile_df["Iu"] * current_profile_df["U"])**2
+        current_profile_df["R_22"] = (current_profile_df["Iv"] * current_profile_df["U"])**2
+        current_profile_df["R_33"] = (current_profile_df["Iw"] * current_profile_df["U"])**2
+        
+        current_profile_df = current_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw"]]
+    
+        current_profile_array = current_profile_df.to_numpy()
+        
+    if len(current_profile_df.columns)==9:
+        
+        columns = ["z", "U", "Iu", "Iv", "Iw", "Lu", "Lv", "Lw", "uwStress"]
+        current_profile_df.columns = columns
+    
+        current_profile_df["R_11"] = (current_profile_df["Iu"] * current_profile_df["U"])**2
+        current_profile_df["R_22"] = (current_profile_df["Iv"] * current_profile_df["U"])**2
+        current_profile_df["R_33"] = (current_profile_df["Iw"] * current_profile_df["U"])**2
+        
+        current_profile_df = current_profile_df[["U", "R_11", "R_22", "R_33", "Lu", "Lv", "Lw", "uwStress"]]
+    
+        current_profile_array = current_profile_df.to_numpy()
     
     return current_profile_array
 
@@ -203,7 +250,7 @@ def get_downstream_dfsr_profile_array(vel_array_3d, time_step, inlet_or_downstre
             
         downstream_profile = np.stack( [mean_vel_array_2d[0], re_stresses[0],
                                         re_stresses[1], re_stresses[2], int_length_scales[0],
-                                        int_length_scales[1], int_length_scales[2] ], axis = 1)
+                                        int_length_scales[1], int_length_scales[2], re_stresses[3] ], axis = 1)
 
     else:
         
@@ -220,7 +267,7 @@ def get_downstream_dfsr_profile_array(vel_array_3d, time_step, inlet_or_downstre
             
         downstream_profile = np.stack( [mean_vel_array_2d[0], re_stresses[0],
                                         re_stresses[1], re_stresses[2], int_length_scales[0],
-                                        int_length_scales[1], int_length_scales[2] ], axis = 1)
+                                        int_length_scales[1], int_length_scales[2], re_stresses[3] ], axis = 1)
     
     return downstream_profile
 

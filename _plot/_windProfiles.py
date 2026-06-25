@@ -128,7 +128,7 @@ def plot_profile(array, norm_heights, x_label, y_label, xlims=None, ylims=None, 
         ax.legend()
     
     if xlims==None:
-        ax.set_xlim(0, None)
+        ax.set_xlim(None, None)
     else:
         ax.set_xlim(xlims[0], xlims[1])
     
