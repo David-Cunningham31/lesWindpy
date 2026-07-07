@@ -47,7 +47,8 @@ Environment variables commonly used:
     MHW_MIN_FACTOR_UW                default 0.70
     MHW_MAX_FACTOR_UW                default 1.40
     MHW_SMOOTH_WINDOW                odd integer; 0 disables, default 0
-    MHW_UPDATE_TARGET_HEIGHT_RANGE   true/false, default true
+    MHW_FULL_HEIGHT                  true/false, default true. If true, update/RMSE uses the whole profile.
+    MHW_UPDATE_TARGET_HEIGHT_RANGE   true/false, default false when MHW_FULL_HEIGHT=true
     MHW_L_METHOD                     firstZero or expFit, default firstZero
     MHW_MAX_LAG_FRACTION             default 0.5
 """
@@ -639,8 +640,21 @@ def load_config() -> CalibrationConfig:
     sim_init = read_sim_init(case_dir)
 
     building_height = env_float("MHW_BUILDING_HEIGHT", setup.get("buildingHeight", 1.0))
-    lower_z = env_float("MHW_LOWER_Z_THRESHOLD", setup.get("lowerZThreshold", 0.25 * building_height))
-    upper_z = env_float("MHW_UPPER_Z_THRESHOLD", setup.get("upperZThreshold", 1.5 * building_height))
+
+    # Full-height calibration is now the default.  The earlier recipes used
+    # lowerZThreshold/upperZThreshold from setUp, which commonly limited the
+    # update/RMSE region to the building-relevant part of the profile.  For the
+    # current calibration campaign we deliberately update and assess every
+    # target-profile height, from the lowest probe/inlet height to the top of
+    # the domain.  To revert to setUp thresholds, set MHW_FULL_HEIGHT=false.
+    full_height_default = env_bool("MHW_FULL_HEIGHT", True)
+    if full_height_default:
+        lower_z = env_float("MHW_LOWER_Z_THRESHOLD", -1.0e30)
+        upper_z = env_float("MHW_UPPER_Z_THRESHOLD", 1.0e30)
+    else:
+        lower_z = env_float("MHW_LOWER_Z_THRESHOLD", setup.get("lowerZThreshold", 0.25 * building_height))
+        upper_z = env_float("MHW_UPPER_Z_THRESHOLD", setup.get("upperZThreshold", 1.5 * building_height))
+
     rmse_threshold = env_float("MHW_RMSE_THRESHOLD", setup.get("rmseThreshold", 0.05))
     burn = env_float("MHW_BURN_IN_TIME", sim_init.get("burn_in_time", 0.0))
 
@@ -679,7 +693,10 @@ def load_config() -> CalibrationConfig:
         max_factor_uw=env_float("MHW_MAX_FACTOR_UW", 1.40),
         rho_uw_limit=env_float("MHW_RHO_UW_LIMIT", 0.999),
         smooth_window=smooth_window,
-        update_target_height_range=env_bool("MHW_UPDATE_TARGET_HEIGHT_RANGE", True),
+        # With full-height calibration, do not mask the update region by default.
+        # The lower_z/upper_z values are still used for RMSE reporting; with the
+        # full-height defaults above they include the whole profile.
+        update_target_height_range=env_bool("MHW_UPDATE_TARGET_HEIGHT_RANGE", not full_height_default),
         l_method=os.environ.get("MHW_L_METHOD", "firstZero"),
         max_lag_fraction=env_float("MHW_MAX_LAG_FRACTION", 0.5),
         z_group_tol=env_float("MHW_Z_GROUP_TOL", 1e-7),

@@ -1381,8 +1381,16 @@ def run_calibration(cfg: CalibrationConfig) -> int:
     setup = parse_case_setup(case_dir)
     sim_init = load_sim_init(case_dir)
     H = float(setup.get("buildingHeight", 0.5))
-    lower = float(setup.get("lowerZThreshold", 0.2*H))
-    upper = float(setup.get("upperZThreshold", 1.5*H))
+    # Full-height RMSE/reporting is now the default for the older common
+    # calibration module too.  Set MANN_CAL_FULL_HEIGHT=false to revert to
+    # setUp lowerZThreshold/upperZThreshold behaviour.
+    _full_height = os.environ.get("MANN_CAL_FULL_HEIGHT", "true").strip().lower() in {"1", "true", "yes", "on", "y"}
+    if _full_height:
+        lower = float(os.environ.get("MANN_CAL_LOWER_Z_THRESHOLD", "-1e30"))
+        upper = float(os.environ.get("MANN_CAL_UPPER_Z_THRESHOLD", "1e30"))
+    else:
+        lower = float(os.environ.get("MANN_CAL_LOWER_Z_THRESHOLD", setup.get("lowerZThreshold", 0.2*H)))
+        upper = float(os.environ.get("MANN_CAL_UPPER_Z_THRESHOLD", setup.get("upperZThreshold", 1.5*H)))
     rmse_threshold = float(setup.get("rmseThreshold", 0.05))
     max_cal_iters = int(os.environ.get("MAX_CAL_ITERS", "30"))
 

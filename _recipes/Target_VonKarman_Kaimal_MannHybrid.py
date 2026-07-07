@@ -43,6 +43,7 @@ sys.path.remove(windlespy_path)
 # ---------------------------------------------------------------------------
 
 case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Co-Spectrum DFSR\OpenFoamTestCase\div_free_corr"
+case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\tilt_aggressive_no_band_corr"
 
 approach_flow_data = (
     r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Wind Tunnel Test Data"
@@ -415,7 +416,7 @@ measured_experimental_profile_df = target_profile_df.copy()
 
 target_profile_df = LES._windTunnel.extend_nheri_profiles_with_reynolds_stress(
     target_profile_df,
-    3,
+    6,
     fit_zmin=None,
     fit_zmax=None,
     uw_extension="constant_correlation",
