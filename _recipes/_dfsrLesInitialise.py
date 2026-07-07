@@ -20,7 +20,6 @@ sys.path.remove(windlespy_path)
 
 #%%
 case_path = os.environ["CASE_DIR"]
-
 variable_dict = LES._caseFiles.parse_setup_file(case_path)
 
 #%%
