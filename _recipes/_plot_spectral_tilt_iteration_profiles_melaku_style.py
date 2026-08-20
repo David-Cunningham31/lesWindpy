@@ -77,7 +77,7 @@ import matplotlib.pyplot as plt
 
 # Case directory containing setUp and log/spectralTiltCalibration.
 # On the cluster this is normally the OpenFOAM case root.
-case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\tilt_aggressive_band_corr"
+case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\classic_wong_dfsr_new_mesh"
 
 # Raw NHERI approach-flow .mat file.
 approach_flow_data = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Wind Tunnel Test Data\NHERI BLWT Tall Building\Approach Flow\Approach Flow - EH160 - Marine Spires - 1200 RPM - 091721_1028.mat"
@@ -89,10 +89,10 @@ SPECTRAL_TILT_RESULTS_ZIP = None
 # SPECTRAL_TILT_RESULTS_ZIP = r"C:\path\to\spectral_tilt_cal_results.zip"
 
 # The calibration log directory relative to case_path.
-CALIBRATION_LOG_REL = os.path.join("log", "spectralTiltCalibration_lengthTilt_withBands")
+CALIBRATION_LOG_REL = os.path.join("log", "downstreamCalibration")
 
 # Output folder name under the spectralTiltCalibration folder, or beside the ZIP.
-OUTPUT_SUBDIR = "profile_review_nheri_spectral_tilt_melaku_style"
+OUTPUT_SUBDIR = "profile_review_nheri_wong_melaku_style"
 
 # Plot vertical ranges. Set to [] and use one manually if you prefer.
 # None means auto/full-height based on available data.

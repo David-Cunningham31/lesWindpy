@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 # =============================================================================
 
 # OpenFOAM case folder.
-CASE_PATH = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Co-Spectrum DFSR\OpenFoamTestCase\div_free_corr"
+CASE_PATH = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\classic_wong_dfsr_new_mesh"
 
 WINDLESPY_PATH = r"C:\Users\david\OneDrive\Documents\PhD\Year 1"
 

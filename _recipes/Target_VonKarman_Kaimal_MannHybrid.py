@@ -43,7 +43,7 @@ sys.path.remove(windlespy_path)
 # ---------------------------------------------------------------------------
 
 case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Co-Spectrum DFSR\OpenFoamTestCase\div_free_corr"
-case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\tilt_aggressive_no_band_corr"
+case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\classic_wong_dfsr_new_mesh"
 
 approach_flow_data = (
     r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Wind Tunnel Test Data"

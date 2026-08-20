@@ -7,6 +7,7 @@ Module for checking whether the turbulence statistics from an OpenFOAM simulatio
 @author: David Cunningham
 """
 
+from matplotlib import pyplot as plt
 from scipy.optimize import curve_fit
 import logging
 import numpy as np
@@ -18,42 +19,227 @@ logger = logging.getLogger(__name__)
 
 #%%
 
-def fit_log_law(U, z, zmin = None, zmax = None):  
+def fit_log_law(
+    U,
+    z,
+    zmin=None,
+    zmax=None,
+    *,
+    plot=True,
+    ax=None,
+    show=True,
+    save_path=None,
+):
     """
-    This function is intended to fit a log-law profile from a velocity and height series.
+    Fit a logarithmic mean-wind profile and optionally plot the result.
+
+    The fitted equation is
+
+        U(z) = (u_star / kappa) * ln((z + z0) / z0)
 
     Parameters
     ----------
-    U : Array of mean wind speed values
-    z : Array of heights
-    zmin : A minimum height from which to fit the log law profile.
-    zmax : A maximum height to which to fit the log law profile - log-law tends to be inaccurate for z>200 m in ABL.
+    U : array-like
+        Mean wind-speed values [m/s].
+    z : array-like
+        Corresponding heights [m].
+    zmin : float, optional
+        Minimum height included in the fit [m].
+    zmax : float, optional
+        Maximum height included in the fit [m].
+    plot : bool, default=True
+        Plot the input data and fitted curve.
+    ax : matplotlib.axes.Axes, optional
+        Existing axes on which to draw. A new figure is created if omitted.
+    show : bool, default=True
+        Call ``plt.show()`` after plotting.
+    save_path : path-like, optional
+        Save the plot to this location.
 
     Returns
     -------
-    TYPE: float
-        u_star - friction velocity value
-    TYPE: float
-        DESCRIPTION: a z_0 value - surface roughness length.
-
+    u_star_fit : float
+        Fitted friction velocity [m/s].
+    z0_fit : float
+        Fitted aerodynamic roughness length [m].
     """
-        
     kappa = 0.41
-    
-    def loglaw(z, u_star, z0):
-        return (u_star/kappa) * np.log((z + z0)/z0)
-    
-    if (zmin != None) and (zmax != None):
-        mask = np.isfinite(z) & np.isfinite(U) & (z > zmin) & (z < zmax)
-    else:
-        mask = np.isfinite(z) & np.isfinite(U) & (z > 0)
-        
-        
-    zf, Uf = z[mask], U[mask]
-    
-    p0 = (1, 0.1)  # initial guesses (u*, z0)
-    (u_star_fit, z0_fit), cov = curve_fit(loglaw, zf, Uf, p0=p0, bounds=(0, np.inf))
-    
+
+    U = np.asarray(U, dtype=float).reshape(-1)
+    z = np.asarray(z, dtype=float).reshape(-1)
+
+    if U.size != z.size:
+        raise ValueError(
+            f"U and z must have the same length; got {U.size} and {z.size}."
+        )
+
+    if zmin is not None and zmax is not None and zmin >= zmax:
+        raise ValueError("zmin must be smaller than zmax.")
+
+    def loglaw(height, u_star, z0):
+        return (u_star / kappa) * np.log((height + z0) / z0)
+
+    # Data that are physically and numerically usable.
+    valid_mask = np.isfinite(z) & np.isfinite(U) & (z > 0.0)
+
+    # Apply either limit independently.
+    fit_mask = valid_mask.copy()
+
+    if zmin is not None:
+        fit_mask &= z >= zmin
+
+    if zmax is not None:
+        fit_mask &= z <= zmax
+
+    z_fit = z[fit_mask]
+    U_fit = U[fit_mask]
+
+    if z_fit.size < 3:
+        raise ValueError(
+            "At least three valid data points are required for the two-"
+            "parameter log-law fit."
+        )
+
+    # Positive lower bounds prevent evaluation at z0 = 0.
+    small_positive = np.finfo(float).eps
+
+    initial_u_star = max(0.05, 0.05 * float(np.nanmax(U_fit)))
+    initial_z0 = min(0.1, 0.1 * float(np.nanmin(z_fit)))
+    initial_z0 = max(initial_z0, 1.0e-4)
+
+    parameters, covariance = curve_fit(
+        loglaw,
+        z_fit,
+        U_fit,
+        p0=(initial_u_star, initial_z0),
+        bounds=(
+            (small_positive, small_positive),
+            (np.inf, np.inf),
+        ),
+        maxfev=20_000,
+    )
+
+    u_star_fit, z0_fit = (float(value) for value in parameters)
+
+    U_predicted = loglaw(z_fit, u_star_fit, z0_fit)
+    residuals = U_fit - U_predicted
+
+    rmse = float(np.sqrt(np.mean(residuals**2)))
+    ss_residual = float(np.sum(residuals**2))
+    ss_total = float(np.sum((U_fit - np.mean(U_fit)) ** 2))
+
+    r_squared = (
+        1.0 - ss_residual / ss_total
+        if ss_total > np.finfo(float).eps
+        else np.nan
+    )
+
+    parameter_std = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+
+    logger.info(
+        "Log-law fit: u_star=%.6g ± %.3g m/s, z0=%.6g ± %.3g m, "
+        "R²=%.6g, RMSE=%.6g m/s, n=%d",
+        u_star_fit,
+        parameter_std[0],
+        z0_fit,
+        parameter_std[1],
+        r_squared,
+        rmse,
+        z_fit.size,
+    )
+
+    if plot:
+        created_figure = ax is None
+
+        if created_figure:
+            figure, ax = plt.subplots(figsize=(6.0, 7.0))
+        else:
+            figure = ax.figure
+
+        excluded_mask = valid_mask & ~fit_mask
+
+        if np.any(excluded_mask):
+            ax.scatter(
+                U[excluded_mask],
+                z[excluded_mask],
+                s=32,
+                facecolors="none",
+                edgecolors="0.65",
+                label="Excluded input data",
+                zorder=2,
+            )
+
+        ax.scatter(
+            U_fit,
+            z_fit,
+            s=38,
+            color="tab:blue",
+            label="Data used for fit",
+            zorder=3,
+        )
+
+        curve_z = np.linspace(
+            float(np.min(z_fit)),
+            float(np.max(z_fit)),
+            500,
+        )
+        curve_U = loglaw(curve_z, u_star_fit, z0_fit)
+
+        ax.plot(
+            curve_U,
+            curve_z,
+            color="tab:red",
+            linewidth=2.0,
+            label="Fitted log law",
+            zorder=4,
+        )
+
+        statistics = (
+            rf"$u_*$ = {u_star_fit:.4g} m/s"
+            "\n"
+            rf"$z_0$ = {z0_fit:.4g} m"
+            "\n"
+            rf"$R^2$ = {r_squared:.4f}"
+            "\n"
+            rf"RMSE = {rmse:.4g} m/s"
+            "\n"
+            rf"$n$ = {z_fit.size}"
+        )
+
+        ax.text(
+            0.04,
+            0.96,
+            statistics,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            bbox={
+                "boxstyle": "round",
+                "facecolor": "white",
+                "edgecolor": "0.7",
+                "alpha": 0.9,
+            },
+        )
+
+        ax.set_xlabel("Mean wind speed, $U$ [m/s]")
+        ax.set_ylabel("Height, $z$ [m]")
+        ax.set_title("Log-law curve fit")
+        ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5)
+        ax.legend()
+
+        if created_figure:
+            figure.tight_layout()
+
+        if save_path is not None:
+            figure.savefig(
+                save_path,
+                dpi=300,
+                bbox_inches="tight",
+            )
+
+        if show:
+            plt.show()
+
     return u_star_fit, z0_fit
     
 #%%

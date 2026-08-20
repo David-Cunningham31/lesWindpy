@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 # USER SETTINGS
 # ---------------------------------------------------------------------------
 
-case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Spectral Calibration Method\empty_domain_test_case\regularDFSR"
+case_path = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\spctral_tilt_cailbration\classic_wong_dfsr_new_mesh"
 approach_flow_data = r"C:\Users\david\OneDrive\Documents\PhD\Year 1\Wind Tunnel Test Data\NHERI BLWT Tall Building\Approach Flow\Approach Flow - EH160 - Marine Spires - 1200 RPM - 091721_1028.mat"
 
 # windLespy import. This script is intended to live in windlespy/_recipes.

@@ -108,6 +108,10 @@ def calc_nheri_int_length_scales(vel_array_3d, time_step=1/1250):
 
 def add_nheri_int_length_scales(profile_df, int_length_scales):
     
+    if "Lu" not in profile_df.columns:
+        Lu = int_length_scales[0,:]
+        profile_df["Lu"] = Lu
+            
     Lv = int_length_scales[1,:]
     Lw = int_length_scales[2,:]
     

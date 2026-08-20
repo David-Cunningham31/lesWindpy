@@ -549,19 +549,65 @@ def autocorr_fft(x: np.ndarray) -> np.ndarray:
     return ac / ac[0]
 
 
-def integral_length_first_zero(x: np.ndarray, dt: float, U: float, max_lag_fraction: float = 0.5) -> float:
+def integral_time_first_zero(
+    x: np.ndarray,
+    dt: float,
+    max_lag_fraction: float = 0.5,
+) -> float:
+    """Integrate the normalized autocorrelation to its first zero crossing.
+
+    The zero-crossing time is linearly interpolated between the final positive
+    autocorrelation ordinate and the first non-positive ordinate.  Returning
+    NaN when no crossing is present prevents a truncated positive tail from
+    being mislabeled as a first-zero integral time scale.
+    """
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be positive and finite; got {dt!r}")
+
     r = autocorr_fft(x)
-    if not np.isfinite(r).all():
+    if r.size < 3 or not np.isfinite(r).all():
         return np.nan
-    nmax = max(3, min(len(r)-1, int(max_lag_fraction*len(r))))
-    rr = r[:nmax]
-    neg = np.where(rr <= 0.0)[0]
-    if neg.size:
-        end = max(2, int(neg[0]))
-    else:
-        end = nmax
-    tau = np.arange(end) * dt
-    return float(U * trapz(rr[:end], x=tau))
+
+    max_index = min(
+        r.size - 1,
+        max(2, int(math.floor(max_lag_fraction * (r.size - 1)))),
+    )
+    rr = r[: max_index + 1]
+    crossings = np.flatnonzero(rr[1:] <= 0.0) + 1
+    if crossings.size == 0:
+        return np.nan
+
+    k = int(crossings[0])
+    r_left = float(rr[k - 1])
+    r_right = float(rr[k])
+    denominator = r_left - r_right
+    fraction = 0.0 if denominator <= 0.0 else r_left / denominator
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+    tau_zero = ((k - 1) + fraction) * float(dt)
+
+    tau = np.arange(k, dtype=float) * float(dt)
+    values = rr[:k].astype(float, copy=False)
+    tau_with_zero = np.append(tau, tau_zero)
+    values_with_zero = np.append(values, 0.0)
+    return float(trapz(values_with_zero, x=tau_with_zero))
+
+
+def integral_length_first_zero(
+    x: np.ndarray,
+    dt: float,
+    U: float,
+    max_lag_fraction: float = 0.5,
+) -> float:
+    """Return L = U*T, with T integrated to the first ACF zero crossing."""
+    integral_time = integral_time_first_zero(
+        x,
+        dt,
+        max_lag_fraction=max_lag_fraction,
+    )
+    if not np.isfinite(integral_time):
+        return np.nan
+    return float(max(float(U), 0.0) * integral_time)
+
 
 
 def integral_length_efold(x: np.ndarray, dt: float, U: float, max_lag_fraction: float = 0.5) -> float:
@@ -586,15 +632,107 @@ def integral_length_efold(x: np.ndarray, dt: float, U: float, max_lag_fraction: 
     return float(U * tau)
 
 
-def compute_downstream_profiles_and_spectra(time: np.ndarray, vel: np.ndarray, positions: np.ndarray, profile_z: np.ndarray, nperseg: int, spectra_freq: np.ndarray, l_method: str = "efold", z_group_tol: float = 1e-6) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, object]]:
-    """Return downstream profile on profile_z and spectra S_down with shape (3,nProfile,nF)."""
+def _welch_parameters_from_spectra_grid(
+    time: np.ndarray,
+    spectra_freq: np.ndarray,
+    requested_nperseg: int,
+) -> Dict[str, object]:
+    """Choose spectral-estimation parameters without losing the record low end.
+
+    A positive ``requested_nperseg`` retains the historical Welch behaviour.
+    A non-positive value selects the Euston mode: use the complete retained
+    record as one Hann-window segment and, where possible, zero-pad to the
+    uniform frequency spacing represented by ``spectraProfile``.  Zero padding
+    aligns/eases interpolation onto that table; it does not create information
+    below the physical resolution 1/T_record.
+    """
+    time = np.asarray(time, float)
+    spectra_freq = np.asarray(spectra_freq, float)
+    if time.size < 16:
+        raise ValueError("At least 16 retained samples are required for spectra")
+    if spectra_freq.size < 2 or np.any(~np.isfinite(spectra_freq)):
+        raise ValueError("spectraProfile must provide at least two finite bins")
+    if np.any(spectra_freq <= 0.0) or np.any(np.diff(spectra_freq) <= 0.0):
+        raise ValueError("spectraProfile frequencies must be positive and increasing")
+
     dt = float(np.median(np.diff(time)))
-    fs = 1.0/dt
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"Could not determine a positive time step; got {dt!r}")
+    fs = 1.0 / dt
+    n_samples = int(time.size)
+
+    df_values = np.diff(spectra_freq)
+    df_profile = float(np.median(df_values))
+    if not np.allclose(
+        df_values,
+        df_profile,
+        rtol=1.0e-6,
+        atol=max(1.0e-14, 1.0e-10 * abs(df_profile)),
+    ):
+        raise ValueError(
+            "spectraProfile frequency bins are not uniformly spaced; "
+            "the current MannHybrid table format is expected to be uniform"
+        )
+
+    if int(requested_nperseg) > 0:
+        nperseg_eff = int(min(max(16, int(requested_nperseg)), n_samples))
+        nfft_eff = nperseg_eff
+        noverlap = int(0.5 * nperseg_eff)
+        mode = "configured Welch segmentation"
+    else:
+        # Full-record segment gives the finest physically available low-frequency
+        # resolution.  Match the spectraProfile spacing where this only requires
+        # zero padding; otherwise retain the full-record FFT and interpolate.
+        nperseg_eff = n_samples
+        target_nfft = max(16, int(round(fs / df_profile)))
+        nfft_eff = max(nperseg_eff, target_nfft)
+        noverlap = 0
+        mode = "full retained record, spectraProfile-aligned FFT grid"
+
+    return {
+        "dt": dt,
+        "fs": fs,
+        "nperseg": nperseg_eff,
+        "noverlap": noverlap,
+        "nfft": int(nfft_eff),
+        "welch_df": float(fs / nfft_eff),
+        "spectra_profile_df": df_profile,
+        "record_duration": float(time[-1] - time[0]),
+        "mode": mode,
+    }
+
+
+def compute_downstream_profiles_and_spectra(
+    time: np.ndarray,
+    vel: np.ndarray,
+    positions: np.ndarray,
+    profile_z: np.ndarray,
+    nperseg: int,
+    spectra_freq: np.ndarray,
+    l_method: str = "efold",
+    z_group_tol: float = 1e-6,
+) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, object]]:
+    """Return downstream statistics on ``profile_z`` and auto-spectra.
+
+    The Euston recipe selects ``l_method='first_zero'`` and ``nperseg=0``.
+    Other positive nperseg values retain the historical segmented-Welch path.
+    """
+    spectral_parameters = _welch_parameters_from_spectra_grid(
+        time,
+        spectra_freq,
+        nperseg,
+    )
+    dt = float(spectral_parameters["dt"])
+    fs = float(spectral_parameters["fs"])
+    nperseg_eff = int(spectral_parameters["nperseg"])
+    noverlap = int(spectral_parameters["noverlap"])
+    nfft_eff = int(spectral_parameters["nfft"])
+
     z_heights, groups = group_probe_indices_by_height(positions, z_group_tol)
     records = []
     S_h = np.zeros((3, len(z_heights), len(spectra_freq)), float)
-    nperseg_eff = int(min(max(16, nperseg), max(16, time.size)))
-    noverlap = int(0.5*nperseg_eff)
+    method_key = l_method.lower().replace("-", "_").strip()
+
     for j, inds in enumerate(groups):
         # Average spectra/statistics across same-height probes, not concatenating them.
         recs_j = []
@@ -605,73 +743,180 @@ def compute_downstream_profiles_and_spectra(time: np.ndarray, vel: np.ndarray, p
             w = vel[2, :, ind]
             Umean = float(np.mean(u))
             means = [Umean, float(np.mean(v)), float(np.mean(w))]
-            sig = [float(np.std(u - means[0], ddof=0)), float(np.std(v - means[1], ddof=0)), float(np.std(w - means[2], ddof=0))]
+            sig = [
+                float(np.std(u - means[0], ddof=0)),
+                float(np.std(v - means[1], ddof=0)),
+                float(np.std(w - means[2], ddof=0)),
+            ]
+
             Lvals = []
-            for comp, x in enumerate([u, v, w]):
+            for component_name, x in zip(("u", "v", "w"), (u, v, w)):
                 xp = x - np.mean(x)
-                if l_method.lower() in {"efold", "exp", "expfit"}:
-                    Lvals.append(integral_length_efold(xp, dt, max(Umean, 1e-12)))
+                if method_key in {"efold", "exp", "expfit"}:
+                    length = integral_length_efold(
+                        xp,
+                        dt,
+                        max(Umean, 1.0e-12),
+                    )
+                elif method_key in {
+                    "first_zero",
+                    "firstzero",
+                    "integral",
+                    "zero_crossing",
+                }:
+                    integral_time = integral_time_first_zero(xp, dt)
+                    if not np.isfinite(integral_time):
+                        raise RuntimeError(
+                            "The normalized autocorrelation did not cross zero "
+                            f"within half the retained record for component "
+                            f"{component_name!r}, probe={int(ind)}, "
+                            f"z={z_heights[j]:.12g}. A first-zero integral "
+                            "length scale cannot be estimated from this record."
+                        )
+                    length = max(Umean, 1.0e-12) * integral_time
                 else:
-                    Lvals.append(integral_length_first_zero(xp, dt, max(Umean, 1e-12)))
+                    raise ValueError(
+                        f"Unknown integral-length method {l_method!r}; use "
+                        "'first_zero' or 'efold'."
+                    )
+                Lvals.append(float(length))
+
             uw = float(np.mean((u - means[0]) * (w - means[2])))
-            recs_j.append([z_heights[j], Umean, sig[0]/max(Umean,1e-12), sig[1]/max(Umean,1e-12), sig[2]/max(Umean,1e-12), Lvals[0], Lvals[1], Lvals[2], uw])
-            for c, x in enumerate([u - means[0], v - means[1], w - means[2]]):
-                fw, Pw = welch(x, fs=fs, window="hann", nperseg=nperseg_eff, noverlap=noverlap, detrend="constant", scaling="density")
-                # drop f=0 and interpolate in log-log where possible
-                valid = (fw > 0) & np.isfinite(Pw) & (Pw > 0)
+            recs_j.append(
+                [
+                    z_heights[j],
+                    Umean,
+                    sig[0] / max(Umean, 1.0e-12),
+                    sig[1] / max(Umean, 1.0e-12),
+                    sig[2] / max(Umean, 1.0e-12),
+                    Lvals[0],
+                    Lvals[1],
+                    Lvals[2],
+                    uw,
+                ]
+            )
+
+            for c, x in enumerate(
+                (u - means[0], v - means[1], w - means[2])
+            ):
+                fw, Pw = welch(
+                    x,
+                    fs=fs,
+                    window="hann",
+                    nperseg=nperseg_eff,
+                    noverlap=noverlap,
+                    nfft=nfft_eff,
+                    detrend="constant",
+                    scaling="density",
+                )
+                valid = (fw > 0.0) & np.isfinite(Pw) & (Pw > 0.0)
                 if np.count_nonzero(valid) < 4:
                     interp = np.full_like(spectra_freq, FLOOR)
                 else:
-                    interp = np.exp(np.interp(np.log(spectra_freq), np.log(fw[valid]), np.log(Pw[valid]), left=np.log(Pw[valid][0]), right=np.log(Pw[valid][-1])))
+                    interp = np.exp(
+                        np.interp(
+                            np.log(spectra_freq),
+                            np.log(fw[valid]),
+                            np.log(Pw[valid]),
+                            left=np.log(Pw[valid][0]),
+                            right=np.log(Pw[valid][-1]),
+                        )
+                    )
                 S_acc[c, :] += interp
+
         arrj = np.asarray(recs_j, float)
         records.append(np.nanmean(arrj, axis=0))
         S_h[:, j, :] = S_acc / max(len(inds), 1)
+
     df_h = pd.DataFrame(np.asarray(records), columns=PROFILE_COLS_UW)
-    # Map to profile_z.
     out = pd.DataFrame({"z": profile_z})
     for col in PROFILE_COLS_UW[1:]:
         out[col] = np.interp(profile_z, df_h["z"], df_h[col])
+
     S_p = np.zeros((3, len(profile_z), len(spectra_freq)), float)
     for c in range(3):
         for k in range(len(spectra_freq)):
-            S_p[c, :, k] = np.interp(profile_z, z_heights, S_h[c, :, k])
-    meta = {"fs": fs, "dt": dt, "nperseg": nperseg_eff, "unique_probe_heights": z_heights.tolist(), "n_height_groups": len(z_heights)}
+            S_p[c, :, k] = np.interp(
+                profile_z,
+                z_heights,
+                S_h[c, :, k],
+            )
+
+    meta = {
+        **spectral_parameters,
+        "integral_length_method": method_key,
+        "unique_probe_heights": z_heights.tolist(),
+        "n_height_groups": len(z_heights),
+    }
     return out, np.maximum(S_p, FLOOR), meta
 
 
-def compute_downstream_uw_cospectrum(time: np.ndarray, vel: np.ndarray, positions: np.ndarray, profile_z: np.ndarray, nperseg: int, spectra_freq: np.ndarray, z_group_tol: float = 1e-6) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Estimate downstream one-sided real u-w co-spectrum Cuw(f,z).
 
-    The integral of the returned spectrum is the resolved <u'w'> covariance
-    implied by the Welch/CSD estimate, up to finite-record estimation error.
-    """
-    dt = float(np.median(np.diff(time)))
-    fs = 1.0/dt
+def compute_downstream_uw_cospectrum(
+    time: np.ndarray,
+    vel: np.ndarray,
+    positions: np.ndarray,
+    profile_z: np.ndarray,
+    nperseg: int,
+    spectra_freq: np.ndarray,
+    z_group_tol: float = 1e-6,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Estimate the one-sided real u-w co-spectrum on the spectraProfile grid."""
+    spectral_parameters = _welch_parameters_from_spectra_grid(
+        time,
+        spectra_freq,
+        nperseg,
+    )
+    fs = float(spectral_parameters["fs"])
+    nperseg_eff = int(spectral_parameters["nperseg"])
+    noverlap = int(spectral_parameters["noverlap"])
+    nfft_eff = int(spectral_parameters["nfft"])
+
     z_heights, groups = group_probe_indices_by_height(positions, z_group_tol)
     C_h = np.zeros((len(z_heights), len(spectra_freq)), float)
-    nperseg_eff = int(min(max(16, nperseg), max(16, time.size)))
-    noverlap = int(0.5*nperseg_eff)
     for j, inds in enumerate(groups):
         C_acc = np.zeros(len(spectra_freq), float)
         for ind in inds:
             up = vel[0, :, ind] - np.mean(vel[0, :, ind])
             wp = vel[2, :, ind] - np.mean(vel[2, :, ind])
-            fw, Puw = csd(up, wp, fs=fs, window="hann", nperseg=nperseg_eff, noverlap=noverlap, detrend="constant", scaling="density")
+            fw, Puw = csd(
+                up,
+                wp,
+                fs=fs,
+                window="hann",
+                nperseg=nperseg_eff,
+                noverlap=noverlap,
+                nfft=nfft_eff,
+                detrend="constant",
+                scaling="density",
+            )
             Cw = np.real(Puw)
-            valid = (fw > 0) & np.isfinite(Cw)
+            valid = (fw > 0.0) & np.isfinite(Cw)
             if np.count_nonzero(valid) < 4:
                 interp = np.zeros_like(spectra_freq)
             else:
-                interp = np.interp(np.log(spectra_freq), np.log(fw[valid]), Cw[valid], left=Cw[valid][0], right=Cw[valid][-1])
+                interp = np.interp(
+                    np.log(spectra_freq),
+                    np.log(fw[valid]),
+                    Cw[valid],
+                    left=Cw[valid][0],
+                    right=Cw[valid][-1],
+                )
             C_acc += interp
         C_h[j, :] = C_acc / max(len(inds), 1)
+
     C_p = np.zeros((len(profile_z), len(spectra_freq)), float)
     for k in range(len(spectra_freq)):
         C_p[:, k] = np.interp(profile_z, z_heights, C_h[:, k])
     C_p[~np.isfinite(C_p)] = 0.0
-    meta = {"fs": fs, "dt": dt, "nperseg": nperseg_eff, "unique_probe_heights": z_heights.tolist(), "n_height_groups": len(z_heights)}
+
+    meta = {
+        **spectral_parameters,
+        "unique_probe_heights": z_heights.tolist(),
+        "n_height_groups": len(z_heights),
+    }
     return C_p, meta
+
 
 
 def make_vonkarman_like_spectra(profile: pd.DataFrame, freq: np.ndarray) -> np.ndarray:
@@ -944,73 +1189,97 @@ def infer_burn_in_time(case_dir: Path, setup: Dict[str, float]) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Resolved-band helpers using the existing windlespy / Geleta-style functions
+# Calibration-band helpers using record duration and setUp maximumFrequency
 # -----------------------------------------------------------------------------
 
-def compute_windlespy_resolved_limits(case_dir: Path, profile: pd.DataFrame, time: np.ndarray, freq: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return per-height resolved f_min/f_max using the existing windlespy functions.
+def compute_windlespy_resolved_limits(
+    case_dir: Path,
+    profile: pd.DataFrame,
+    time: np.ndarray,
+    freq: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the calibration frequency band on the spectraProfile grid.
 
-    This deliberately reuses the same functions used in the target setup scripts:
-
-        LES._caseFiles.parse_setup_file(case_dir)
-        LES._profileAnalysis.get_mesh_cutoff_frequencies(meshSize, U, L, sigma)
-        LES._profileCalibration.get_resolved_frequency_limits(time_steps, mesh_cutoff_freq)
-
-    The mesh size is the scalar ``meshSize`` in setUp.  This version does not
-    introduce a separate mesh-size-profile model, because the aim is to remain
-    consistent with the existing windlespy/Geleta workflow.
+    The lower physical limit is the reciprocal of the retained time-series
+    duration.  The upper physical limit is the user-supplied
+    ``maximumFrequency`` scalar in ``setUp``, parsed using windlespy.  The
+    limits returned to the existing height-wise calibration code are the first
+    and last actual spectraProfile bins inside those physical limits.
     """
     try:
         import windlespy as LES  # type: ignore
     except Exception as exc:
         raise RuntimeError(
-            "MST_USE_WINDLESPY_RESOLVED_BAND=true requires windlespy to be importable. "
-            "Set PYTHONPATH to the parent folder containing windlespy."
+            "Frequency-band selection requires windlespy to be importable. "
+            "Set PYTHONPATH to the parent directory containing windlespy."
         ) from exc
 
     variable_dict = LES._caseFiles.parse_setup_file(str(case_dir))
-    mesh_size = float(variable_dict.get("meshSize", variable_dict.get("mesh_size", np.nan)))
-    if not np.isfinite(mesh_size) or mesh_size <= 0.0:
-        raise ValueError("Could not obtain a positive meshSize from setUp via windlespy.")
-
-    U = profile["U"].to_numpy(float)
-    L = profile[["Lu", "Lv", "Lw"]].to_numpy(float).T
-    sigmas = np.vstack([
-        profile["Iu"].to_numpy(float) * U,
-        profile["Iv"].to_numpy(float) * U,
-        profile["Iw"].to_numpy(float) * U,
-    ])
-
-    mesh_cutoff_freqs = np.asarray(
-        LES._profileAnalysis.get_mesh_cutoff_frequencies(mesh_size, U, L, sigmas),
-        dtype=float,
-    ).reshape(-1)
-
-    if time.size >= 2:
-        # use the actual post-burn-in record length/time spacing from this iteration
-        dt = float(np.median(np.diff(time)))
-        duration = float(time[-1] - time[0])
-        time_steps = np.arange(0.0, duration + 0.5*dt, dt)
-    else:
-        time_steps = np.asarray([0.0, 1.0], dtype=float)
-
-    fmin = np.full(len(profile), float(freq[0]), dtype=float)
-    fmax = np.full(len(profile), float(freq[-1]), dtype=float)
-
-    for h in range(len(profile)):
-        limits = LES._profileCalibration.get_resolved_frequency_limits(
-            time_steps,
-            mesh_cutoff_freq=float(mesh_cutoff_freqs[h]),
+    if "maximumFrequency" not in variable_dict:
+        raise ValueError(
+            "Could not find the required scalar 'maximumFrequency' in setUp. "
+            "Set this to the case-specific Geleta cutoff frequency in Hz."
         )
-        fmin[h] = float(np.asarray(limits["f_min"]).reshape(-1)[0])
-        fmax[h] = float(np.asarray(limits["f_max"]).reshape(-1)[0])
-        # keep within actual tabulated frequency range
-        fmin[h] = max(fmin[h], float(freq[0]))
-        fmax[h] = min(fmax[h], float(freq[-1]))
-        if fmax[h] <= fmin[h]:
-            fmax[h] = min(float(freq[-1]), max(float(freq[0]), float(mesh_cutoff_freqs[h])))
 
-    return fmin, fmax, mesh_cutoff_freqs
+    configured_maximum = float(variable_dict["maximumFrequency"])
+    if not np.isfinite(configured_maximum) or configured_maximum <= 0.0:
+        raise ValueError(
+            "setUp:maximumFrequency must be positive and finite; found "
+            f"{variable_dict['maximumFrequency']!r}"
+        )
+
+    time = np.asarray(time, float)
+    freq = np.asarray(freq, float)
+    if time.size < 2:
+        raise ValueError("At least two retained time samples are required")
+    if freq.size < 2 or np.any(~np.isfinite(freq)):
+        raise ValueError("spectraProfile must contain at least two finite bins")
+    if np.any(freq <= 0.0) or np.any(np.diff(freq) <= 0.0):
+        raise ValueError(
+            "spectraProfile frequencies must be positive and strictly increasing"
+        )
+
+    duration = float(time[-1] - time[0])
+    dt = float(np.median(np.diff(time)))
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError(f"Retained record duration is invalid: {duration!r}")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"Retained sample interval is invalid: {dt!r}")
+
+    physical_minimum = 1.0 / duration
+    nyquist = 1.0 / (2.0 * dt)
+    physical_maximum = min(configured_maximum, nyquist, float(freq[-1]))
+
+    active_indices = np.flatnonzero(
+        (freq >= physical_minimum) & (freq <= physical_maximum)
+    )
+    if active_indices.size < 2:
+        raise ValueError(
+            "The calibration band contains fewer than two spectraProfile "
+            f"bins: 1/T={physical_minimum:.12g} Hz, "
+            f"setUp:maximumFrequency={configured_maximum:.12g} Hz, "
+            f"Nyquist={nyquist:.12g} Hz, table=[{freq[0]:.12g}, "
+            f"{freq[-1]:.12g}] Hz."
+        )
+
+    selected_minimum = float(freq[int(active_indices[0])])
+    selected_maximum = float(freq[int(active_indices[-1])])
+    print(
+        "Calibration frequency band: "
+        f"1/T_record={physical_minimum:.12g} Hz; "
+        f"first spectraProfile bin={selected_minimum:.12g} Hz; "
+        f"setUp:maximumFrequency={configured_maximum:.12g} Hz; "
+        f"last spectraProfile bin={selected_maximum:.12g} Hz",
+        flush=True,
+    )
+
+    n_heights = len(profile)
+    return (
+        np.full(n_heights, selected_minimum, dtype=float),
+        np.full(n_heights, selected_maximum, dtype=float),
+        np.full(n_heights, configured_maximum, dtype=float),
+    )
+
 
 
 def integrate_1d_between(freq: np.ndarray, y: np.ndarray, fmin: float, fmax: float) -> float:
@@ -1328,6 +1597,13 @@ def update_profile_wong(
             relaxation_factor=cfg.wong_relaxation_factor,
         )
 
+        # EUSTON_CALIBRATION_FREQUENCY_VARIANCE_FIX_V2
+        # Preserve the windlespy Wong update exactly.  Apply only a final
+        # positivity safeguard to the mean-velocity column so a non-positive
+        # candidate cannot be written to the active profile.  No additional
+        # relaxation is applied in the Wong branch.
+        new_array[:, 0] = np.maximum(new_array[:, 0], 0.01)
+
         keep_lengths = None if cfg.update_profile_length else current
         keep_uw = None if cfg.update_uw_stress else current
         candidate = wong_array_to_profile_df(current, new_array, keep_lengths_from=keep_lengths, keep_uw_from=keep_uw)
@@ -1391,14 +1667,14 @@ def apply_spectral_tilt(
     resolved_fmin: Optional[np.ndarray] = None,
     resolved_fmax: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-    """Apply spectral-shape correction and resolved-band area renormalisation.
+    """Apply the spectral-shape correction without changing variance.
 
     Supported modes relevant to the three requested calibration variants:
 
     ``length_tilt`` / ``length``
         Use log(L_down/L_target) as the tilt control signal.  No band-energy
-        correction is applied.  Final resolved-band area is locked to the
-        Wong-updated variance.
+        correction is applied.  The resolved-band area is normalized once
+        after this function returns.
 
     ``length_tilt_bands`` / ``length_bands``
         Same length-error-directed tilt, plus an optional band-energy correction
@@ -1506,18 +1782,10 @@ def apply_spectral_tilt(
                 continue
             f_mask_j = (freq >= fmin_j) & (freq <= fmax_j)
 
-            # Area update / final normalisation target.  With the windlespy Wong
-            # update enabled, this is the Wong-updated time-series variance.
-            cur_area = max(integrate_1d_between(freq, Sj, fmin_j, fmax_j), FLOOR)
-            if cfg.use_windlespy_wong_update:
-                new_area = max(float((updated_profile[I_COL[comp]].iloc[j] * updated_profile["U"].iloc[j])**2), FLOOR)
-            elif cfg.normalize_to_target_variance:
-                new_area = max(float((target_profile[I_COL[comp]].iloc[j] * target_profile["U"].iloc[j])**2), FLOOR)
-            else:
-                down_area = max(integrate_1d_between(freq, S_down[ci, j, :], fmin_j, fmax_j), FLOOR)
-                tar_area = max(float((target_profile[I_COL[comp]].iloc[j] * target_profile["U"].iloc[j])**2), FLOOR)
-                log_area = cfg.variance_relax * np.clip(math.log(tar_area/down_area), -cfg.max_log_area_update, cfg.max_log_area_update)
-                new_area = cur_area * math.exp(log_area)
+            # Variance is deliberately not changed here.  This function
+            # applies spectral shape only; run_calibration performs the
+            # single resolved-band normalization to the Wong-updated
+            # variance after all component tilts have been applied.
 
             # Directional controls.
             dmu = float(mu_t[ci, j] - mu_d[ci, j])
@@ -1612,9 +1880,8 @@ def apply_spectral_tilt(
             Sj2 = Sj.copy()
             Sj2[f_mask_j] = np.maximum(Sj[f_mask_j] * np.exp(log_mult[f_mask_j]), FLOOR)
 
-            # Preserve/update resolved-band area exactly, not full-band area.
-            area2 = max(integrate_1d_between(freq, Sj2, fmin_j, fmax_j), FLOOR)
-            Sj2[f_mask_j] *= float(new_area) / area2
+            # Do not normalize variance inside the tilt operation.  A single
+            # common-band normalization is applied by run_calibration below.
             S_new[ci, j, :] = np.maximum(Sj2, FLOOR)
 
     return S_new, metrics
@@ -1902,13 +2169,13 @@ def run_calibration(cfg: TiltConfig) -> int:
     Cuw_down, cuw_meta = compute_downstream_uw_cospectrum(time, vel, positions, z, cfg.nperseg, freq)
 
     if cfg.use_windlespy_resolved_band:
-        resolved_fmin, resolved_fmax, mesh_cutoff_freqs = compute_windlespy_resolved_limits(case_dir, target, time, freq)
+        resolved_fmin, resolved_fmax, configured_maximum_frequencies = compute_windlespy_resolved_limits(case_dir, target, time, freq)
         pd.DataFrame({
             "z": z,
             "z_over_H": z/float(cfg.building_height),
             "resolved_fmin": resolved_fmin,
             "resolved_fmax": resolved_fmax,
-            "mesh_cutoff_freq": mesh_cutoff_freqs,
+            "configured_maximum_frequency": configured_maximum_frequencies,
         }).to_csv(itdir / "data" / "windlespy_resolved_frequency_limits.csv", index=False)
     else:
         resolved_fmin = np.full(len(z), max(cfg.f_min, float(freq[0])), dtype=float)
