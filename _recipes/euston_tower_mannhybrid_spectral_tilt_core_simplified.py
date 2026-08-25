@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mann_spectral_tilt_common.py
+Simplified Euston Tower MannHybrid spectral-tilt calibration core.
 
-Band-integrated / spectral-tilt downstream calibration for MannHybridTurb.
+This revision deliberately retains the established NHERI/Euston controller,
+while allowing its tilt gain and hard log-tilt limit to be specified separately
+for u, v and w.  It does not add a length-error deadband, a length-error cap,
+or smoothing over height.  Target auto-spectra remain the tabulated von Karman
+spectra used by MannHybridTurb.
 
-This is a deliberately coarse spectral calibration method: it updates the active
-MannHybridTurb spectraProfile using band energies and spectral moments instead
-of noisy frequency-by-frequency ratios. It is intended for cases where the
-MannHybridTurb dictionary uses tabulated auto spectra, e.g.
+It is intended for cases where the MannHybridTurb dictionary uses tabulated
+auto spectra, e.g.
 
     targetSpectraSource       tabulated;
     spectraProfileFile        "spectraProfile";
@@ -21,8 +23,10 @@ The script writes:
     constant/boundaryData/windProfile/spectraProfile
     constant/boundaryData/windProfile/uwCoSpectrumProfile   (when enabled)
 
-It reuses windlespy for the Wong profile update and mesh-cutoff helpers. It reads
-OpenFOAM probe files and MannHybridTurb profile/spectra files directly.
+It reuses windlespy for the unchanged Wong profile update.  The only
+post-Wong safeguards are positive mean velocity and an absolute turbulence-
+intensity ceiling.  It reads OpenFOAM probe files and MannHybridTurb
+profile/spectra files directly.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import shutil
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -56,6 +60,10 @@ I_COL = {"u": "Iu", "v": "Iv", "w": "Iw"}
 L_COL = {"u": "Lu", "v": "Lv", "w": "Lw"}
 COMP_INDEX = {"u": 0, "v": 1, "w": 2}
 FLOOR = 1.0e-16
+NUMERICAL_ZERO = 1.0e-12
+MINIMUM_MEAN_SPEED = 0.01
+
+ComponentParameter = Union[float, Mapping[str, float]]
 
 VEC_RE = re.compile(r"\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\)")
 PROBE_RE = re.compile(r"^\s*#\s*Probe\s+(\d+)\s+\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\)")
@@ -85,6 +93,35 @@ def env_int(name: str, default: int) -> int:
 def env_str(name: str, default: str) -> str:
     raw = os.environ.get(name)
     return default if raw is None or raw.strip() == "" else raw.strip()
+
+
+def component_parameter_value(
+    parameter: ComponentParameter,
+    component: str,
+    parameter_name: str,
+) -> float:
+    """Return one component's value from a scalar or explicit component map.
+
+    A scalar retains the original common-setting behaviour.  A mapping must
+    contain the requested component explicitly, which avoids any hidden
+    fallback or precedence between common and component-specific controls.
+    """
+    if isinstance(parameter, Mapping):
+        if component not in parameter:
+            raise ValueError(
+                f"{parameter_name} is missing component {component!r}; "
+                "provide explicit values for every active component"
+            )
+        value = float(parameter[component])
+    else:
+        value = float(parameter)
+
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f"{parameter_name}[{component!r}] must be finite and non-negative; "
+            f"got {value!r}"
+        )
+    return value
 
 
 def trapz(y, x=None, dx=1.0, axis=-1):
@@ -714,8 +751,8 @@ def compute_downstream_profiles_and_spectra(
 ) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, object]]:
     """Return downstream statistics on ``profile_z`` and auto-spectra.
 
-    The Euston recipe selects ``l_method='first_zero'`` and ``nperseg=0``.
-    Other positive nperseg values retain the historical segmented-Welch path.
+    The simplified Euston recipe selects ``l_method='efold'`` and
+    ``nperseg=4096``, using the historical 50%-overlapped Welch path.
     """
     spectral_parameters = _welch_parameters_from_spectra_grid(
         time,
@@ -1027,9 +1064,13 @@ def band_energies(S: np.ndarray, freq: np.ndarray, edges: np.ndarray) -> np.ndar
 
 
 
-def _direction(value: float, deadband: float = 1.0e-8) -> int:
-    """Return the sign of a control signal, with a small deadband."""
-    if not np.isfinite(value) or abs(float(value)) <= deadband:
+def _direction(value: float) -> int:
+    """Return the sign of a finite control signal.
+
+    ``NUMERICAL_ZERO`` is only a floating-point guard.  It is not an
+    engineering length-error deadband or a tunable controller setting.
+    """
+    if not np.isfinite(value) or abs(float(value)) <= NUMERICAL_ZERO:
         return 0
     return 1 if float(value) > 0.0 else -1
 
@@ -1070,24 +1111,6 @@ def _local_band_log_update(
         logs[b] = float(relax) * np.clip(math.log(Et / Ed), -max_log_update, max_log_update)
     return centers, logs
 
-def smooth_profile_values(values: np.ndarray, window: int = 3) -> np.ndarray:
-    arr = np.asarray(values, float).copy()
-    if window <= 1:
-        return arr
-    if window % 2 == 0:
-        window += 1
-    pad = window // 2
-    padded = np.pad(arr, ((pad, pad), (0, 0)) if arr.ndim == 2 else (pad, pad), mode="edge")
-    out = np.empty_like(arr)
-    if arr.ndim == 1:
-        for i in range(arr.shape[0]):
-            out[i] = np.nanmedian(padded[i:i+window])
-    else:
-        for i in range(arr.shape[0]):
-            out[i, :] = np.nanmedian(padded[i:i+window, :], axis=0)
-    return out
-
-
 @dataclass
 class TiltConfig:
     case_dir: Path
@@ -1123,19 +1146,17 @@ class TiltConfig:
     profile_relax_uw: float = 0.20
     variance_relax: float = 0.50
     shape_relax: float = 0.60
-    moment_relax: float = 0.80
-    # Used by the length-error and guarded-centroid tilt controllers.
-    # Values below this are treated as no clear direction.
-    tilt_deadband: float = 1.0e-8
+    # Each controller setting may be one common scalar (legacy behaviour) or
+    # an explicit {"u": ..., "v": ..., "w": ...} component mapping.
+    moment_relax: ComponentParameter = 0.50
     # For any band-energy correction, compute correction bands over each
     # height's local resolved range rather than one global frequency range.
     band_correction_uses_resolved_range: bool = True
     max_log_area_update: float = math.log(2.0)
     max_log_band_update: float = math.log(3.0)
-    max_log_tilt: float = math.log(4.0)
+    max_log_tilt: ComponentParameter = 0.70
     max_log_uw_update: float = math.log(2.0)
     rho_uw_limit: float = 0.98
-    smooth_window_z: int = 3
     update_profile_intensity: bool = True
     update_profile_length: bool = False
     update_uw_stress: bool = True
@@ -1144,6 +1165,7 @@ class TiltConfig:
     normalize_to_target_variance: bool = False
     use_windlespy_wong_update: bool = True
     wong_relaxation_factor: float = 0.9
+    max_turbulence_intensity: float = 0.50
     use_windlespy_resolved_band: bool = True
     uw_cospectrum_resolved_band_only: bool = True
     write_plots: bool = True
@@ -1189,7 +1211,7 @@ def infer_burn_in_time(case_dir: Path, setup: Dict[str, float]) -> float:
 
 
 # -----------------------------------------------------------------------------
-# Calibration-band helpers using record duration and setUp maximumFrequency
+# Calibration-band helpers using the MannHybrid active-frequency ceiling
 # -----------------------------------------------------------------------------
 
 def compute_windlespy_resolved_limits(
@@ -1202,9 +1224,10 @@ def compute_windlespy_resolved_limits(
 
     The lower physical limit is the reciprocal of the retained time-series
     duration.  The upper physical limit is the user-supplied
-    ``maximumFrequency`` scalar in ``setUp``, parsed using windlespy.  The
-    limits returned to the existing height-wise calibration code are the first
-    and last actual spectraProfile bins inside those physical limits.
+    ``maximumFrequency`` scalar in ``setUp``.  This is treated as the active
+    MannHybrid generator ceiling, not as a separately fitted Kaimal cutoff.
+    The limits returned to the height-wise calibration code are the first and
+    last actual spectraProfile bins inside those physical limits.
     """
     try:
         import windlespy as LES  # type: ignore
@@ -1218,7 +1241,7 @@ def compute_windlespy_resolved_limits(
     if "maximumFrequency" not in variable_dict:
         raise ValueError(
             "Could not find the required scalar 'maximumFrequency' in setUp. "
-            "Set this to the case-specific Geleta cutoff frequency in Hz."
+            "Set this to the active MannHybrid maximum frequency in Hz."
         )
 
     configured_maximum = float(variable_dict["maximumFrequency"])
@@ -1369,7 +1392,12 @@ def enforce_mannhybrid_inflow_mode(cfg: TiltConfig) -> TiltConfig:
 
 
 def default_config(mode: str = "moment", components: Sequence[str] = ("v", "w"), **overrides) -> TiltConfig:
-    case_dir = Path(os.environ.get("CASE_DIR", ".")).resolve()
+    case_dir_override = overrides.pop("case_dir", None)
+    case_dir = Path(
+        case_dir_override
+        if case_dir_override is not None
+        else os.environ.get("CASE_DIR", ".")
+    ).expanduser().resolve()
     setup = parse_set_up(case_dir)
     H = env_float("MST_BUILDING_HEIGHT", setup.get("buildingHeight", 0.5))
     full_height = env_bool("MST_FULL_HEIGHT", True)
@@ -1401,15 +1429,13 @@ def default_config(mode: str = "moment", components: Sequence[str] = ("v", "w"),
         profile_relax_uw=env_float("MST_RELAX_UW", 0.10),
         variance_relax=env_float("MST_VARIANCE_RELAX", 0.50),
         shape_relax=env_float("MST_SHAPE_RELAX", 0.60),
-        moment_relax=env_float("MST_MOMENT_RELAX", 0.80),
-        tilt_deadband=env_float("MST_TILT_DEADBAND", 1.0e-8),
+        moment_relax=env_float("MST_MOMENT_RELAX", 0.50),
         band_correction_uses_resolved_range=env_bool("MST_BANDS_LOCAL_RESOLVED", True),
         max_log_area_update=env_float("MST_MAX_LOG_AREA_UPDATE", math.log(2.0)),
         max_log_band_update=env_float("MST_MAX_LOG_BAND_UPDATE", math.log(3.0)),
-        max_log_tilt=env_float("MST_MAX_LOG_TILT", math.log(4.0)),
+        max_log_tilt=env_float("MST_MAX_LOG_TILT", 0.70),
         max_log_uw_update=env_float("MST_MAX_LOG_UW_UPDATE", math.log(2.0)),
         rho_uw_limit=env_float("MST_RHO_UW_LIMIT", 0.98),
-        smooth_window_z=env_int("MST_SMOOTH_WINDOW_Z", 3),
         update_profile_intensity=env_bool("MST_UPDATE_PROFILE_INTENSITY", True),
         update_profile_length=env_bool("MST_UPDATE_PROFILE_LENGTH", False),
         update_uw_stress=env_bool("MST_UPDATE_UW_STRESS", True),
@@ -1418,6 +1444,7 @@ def default_config(mode: str = "moment", components: Sequence[str] = ("v", "w"),
         normalize_to_target_variance=env_bool("MST_NORMALIZE_TO_TARGET_VARIANCE", False),
         use_windlespy_wong_update=env_bool("MST_USE_WINDLESPY_WONG_UPDATE", True),
         wong_relaxation_factor=env_float("MST_WONG_RELAXATION_FACTOR", 0.9),
+        max_turbulence_intensity=env_float("MST_MAX_TURBULENCE_INTENSITY", 0.50),
         use_windlespy_resolved_band=env_bool("MST_USE_WINDLESPY_RESOLVED_BAND", True),
         uw_cospectrum_resolved_band_only=env_bool("MST_UW_RESOLVED_BAND_ONLY", True),
         write_plots=env_bool("MST_WRITE_PLOTS", True),
@@ -1555,6 +1582,61 @@ def exact_windlespy_wong_update(
         return new_inlet_profile
 
 
+def apply_minimal_profile_safeguards(
+    wong_candidate: np.ndarray,
+    max_turbulence_intensity: float,
+) -> np.ndarray:
+    """Apply only the user-requested physical safeguards after Wong.
+
+    The Wong update itself is unchanged.  Afterwards, mean speed is required
+    to be positive and each normal stress is limited so that
+    ``0 <= sqrt(R_ii)/U <= max_turbulence_intensity``.  No per-iteration trust
+    region, target-relative envelope, or lower turbulence-intensity target is
+    imposed.
+    """
+    if not np.isfinite(max_turbulence_intensity) or not (
+        0.0 < max_turbulence_intensity <= 1.0
+    ):
+        raise ValueError(
+            "max_turbulence_intensity must be finite and in (0, 1]"
+        )
+
+    out = np.asarray(wong_candidate, float).copy()
+    if out.ndim != 2 or out.shape[1] < 4:
+        raise ValueError("Wong candidate must contain U, R11, R22 and R33")
+
+    original_u = out[:, 0].copy()
+    valid_u = np.isfinite(original_u) & (original_u > 0.0)
+    out[:, 0] = np.where(
+        valid_u,
+        np.maximum(original_u, MINIMUM_MEAN_SPEED),
+        MINIMUM_MEAN_SPEED,
+    )
+
+    normal_stresses = out[:, 1:4]
+    original_stresses = normal_stresses.copy()
+    normal_stresses = np.where(
+        np.isfinite(normal_stresses), normal_stresses, 0.0
+    )
+    max_variance = (
+        max_turbulence_intensity * out[:, 0]
+    )[:, None] ** 2
+    out[:, 1:4] = np.clip(normal_stresses, 0.0, max_variance)
+
+    u_repairs = int(np.count_nonzero(~np.isclose(out[:, 0], original_u)))
+    stress_repairs = int(
+        np.count_nonzero(~np.isclose(out[:, 1:4], original_stresses))
+    )
+    if u_repairs or stress_repairs:
+        print(
+            "Post-Wong physical safeguards applied: "
+            f"U repairs={u_repairs}, normal-stress/TI caps={stress_repairs}",
+            flush=True,
+        )
+
+    return out
+
+
 def update_profile_wong(
     current: pd.DataFrame,
     target: pd.DataFrame,
@@ -1597,12 +1679,12 @@ def update_profile_wong(
             relaxation_factor=cfg.wong_relaxation_factor,
         )
 
-        # EUSTON_CALIBRATION_FREQUENCY_VARIANCE_FIX_V2
-        # Preserve the windlespy Wong update exactly.  Apply only a final
-        # positivity safeguard to the mean-velocity column so a non-positive
-        # candidate cannot be written to the active profile.  No additional
-        # relaxation is applied in the Wong branch.
-        new_array[:, 0] = np.maximum(new_array[:, 0], 0.01)
+        # Keep the Wong rule unchanged. Apply only the requested post-update
+        # physical safeguards: U > 0 and Iu/Iv/Iw <= the absolute TI ceiling.
+        new_array = apply_minimal_profile_safeguards(
+            new_array,
+            cfg.max_turbulence_intensity,
+        )
 
         keep_lengths = None if cfg.update_profile_length else current
         keep_uw = None if cfg.update_uw_stress else current
@@ -1767,6 +1849,12 @@ def apply_spectral_tilt(
             continue
         ci = COMP_INDEX[comp]
         Lcol = L_COL[comp]
+        moment_relax_i = component_parameter_value(
+            cfg.moment_relax, comp, "moment_relax"
+        )
+        max_log_tilt_i = component_parameter_value(
+            cfg.max_log_tilt, comp, "max_log_tilt"
+        )
         metrics["L_target"][ci, :] = target_profile[Lcol].to_numpy(float)
         metrics["L_downstream"][ci, :] = downstream_profile[Lcol].to_numpy(float)
         metrics["L_current"][ci, :] = current_profile[Lcol].to_numpy(float)
@@ -1775,7 +1863,8 @@ def apply_spectral_tilt(
                 continue
             Sj = np.maximum(S_new[ci, j, :].copy(), FLOOR)
 
-            # Height-specific resolved frequency range from windlespy/Geleta method.
+            # Active MannHybrid frequency range (the Euston workflow uses the
+            # common maximumFrequency ceiling at every height).
             fmin_j = f_update_min if resolved_fmin is None else max(f_update_min, float(resolved_fmin[j]))
             fmax_j = f_update_max if resolved_fmax is None else min(f_update_max, float(resolved_fmax[j]))
             if fmax_j <= fmin_j or np.count_nonzero((freq >= fmin_j) & (freq <= fmax_j)) < 2:
@@ -1802,8 +1891,8 @@ def apply_spectral_tilt(
                 control = lerr
                 source = 2
             elif uses_guarded_centroid:
-                s_mu = _direction(dmu, cfg.tilt_deadband)
-                s_L = _direction(lerr, cfg.tilt_deadband)
+                s_mu = _direction(dmu)
+                s_L = _direction(lerr)
                 if s_mu != 0 and s_L != 0 and s_mu != s_L:
                     # Centroid and integral-length signals imply opposite tilt
                     # directions.  Use the physically direct L-error signal.
@@ -1834,14 +1923,14 @@ def apply_spectral_tilt(
 
             # Shape update only in the resolved/recoverable band.
             log_mult = np.zeros_like(freq)
-            if source in {1, 2} and abs(control) > cfg.tilt_deadband:
+            if source in {1, 2} and abs(control) > NUMERICAL_ZERO:
                 # Positive control means: downstream eddies are too long for the
                 # L-error controller, or downstream centroid is too low for the
                 # centroid controller.  In both cases, boost high f and suppress
                 # low f.  Negative control does the opposite.
                 var_lnf = max(float(np.var(lnf[f_mask_j])), 1e-12)
                 pivot = float(mu_c[ci, j]) if np.isfinite(mu_c[ci, j]) else float(np.mean(lnf[f_mask_j]))
-                log_mult += cfg.moment_relax * control * (lnf - pivot) / var_lnf
+                log_mult += moment_relax_i * control * (lnf - pivot) / var_lnf
 
             if uses_band_correction:
                 if cfg.band_correction_uses_resolved_range:
@@ -1874,7 +1963,7 @@ def apply_spectral_tilt(
                     log_mult[low] += cfg.shape_relax * np.clip(r_low, -cfg.max_log_band_update, cfg.max_log_band_update)
                     log_mult[high] += cfg.shape_relax * np.clip(r_high, -cfg.max_log_band_update, cfg.max_log_band_update)
 
-            log_mult = np.clip(log_mult, -cfg.max_log_tilt, cfg.max_log_tilt)
+            log_mult = np.clip(log_mult, -max_log_tilt_i, max_log_tilt_i)
 
             # Apply only inside local resolved update band; leave unresolved tail unchanged.
             Sj2 = Sj.copy()
@@ -2204,6 +2293,20 @@ def run_calibration(cfg: TiltConfig) -> int:
         ci = COMP_INDEX[comp]
         area = integrate_heightwise_between(freq, S_updated[ci, :, :], resolved_fmin, resolved_fmax)
         updated_profile[I_COL[comp]] = np.sqrt(np.maximum(area, 0.0)) / np.maximum(updated_profile["U"], 1e-12)
+
+    # The spectrum/profile synchronisation above should preserve the requested
+    # absolute TI ceiling exactly. Fail rather than silently write an
+    # inconsistent profile if numerical integration ever violates it.
+    active_intensities = updated_profile.loc[
+        cal_mask, ["Iu", "Iv", "Iw"]
+    ].to_numpy(float)
+    if np.any(~np.isfinite(active_intensities)) or np.any(
+        active_intensities > cfg.max_turbulence_intensity * (1.0 + 1.0e-9)
+    ):
+        raise RuntimeError(
+            "Final active profile violates max_turbulence_intensity after "
+            "spectral-area synchronisation"
+        )
 
     # Preserve the original final realizability limiter only when Reynolds
     # shear stress is being calibrated.  Otherwise leave the profile column

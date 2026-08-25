@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Euston Tower MannHybrid downstream spectral-tilt calibration recipe.
+"""Simplified Euston Tower MannHybrid spectral-tilt calibration recipe.
 
 This is the small, case-specific configuration layer. The numerical engine is
-implemented in :mod:`euston_tower_mannhybrid_spectral_tilt_core`; keep both
-files together in the OpenFOAM case directory or in ``windlespy/_recipes``.
+implemented in
+:mod:`euston_tower_mannhybrid_spectral_tilt_core_simplified`; keep both files
+together in the OpenFOAM case directory or in ``windlespy/_recipes``.
 
 Exit-code contract used by the MeluXina driver
 -----------------------------------------------
@@ -18,6 +19,7 @@ Exit-code contract used by the MeluXina driver
 
 import sys
 import traceback
+from pathlib import Path
 
 
 # MannHybridTurb generator behaviour:
@@ -32,42 +34,74 @@ import traceback
 INFLOW_MODE = "sameComponentCoherence"
 
 
+# Spectral-tilt controller settings, specified independently for each velocity
+# component.  The values below reproduce the previous common settings exactly;
+# edit u and/or w here when a more aggressive component-specific update is
+# required.  v can therefore remain at its present, well-behaved settings.
+MOMENT_RELAX = {
+    "u": 0.50,
+    "v": 0.50,
+    "w": 0.50,
+}
+
+# Hard limits applied to g_i(f) before exp(g_i) is used to modify the spectrum.
+# A limit of 0.70 bounds the pre-renormalisation multiplier to approximately
+# 0.497--2.014 in one calibration pass.
+MAX_LOG_TILT = {
+    "u": 0.70,
+    "v": 0.70,
+    "w": 0.70,
+}
+
+
+# Optional Spyder/IDE setting. Leave as None when CASE_DIR is exported or the
+# IDE working directory is the OpenFOAM case directory.
+IDE_CASE_PATH = None  # e.g. Path(r"C:\path\to\euston_empty_domain_case")
+
+
 def main() -> int:
     """Build the Euston-specific configuration and run one calibration pass."""
-    from euston_tower_mannhybrid_spectral_tilt_core import (
+    from euston_tower_mannhybrid_spectral_tilt_core_simplified import (
         default_config,
         run_calibration,
     )
 
-    # Variety 1 (unchanged algorithm and tuned values):
+    # Deliberately simplified controller:
     #   - Profile U, R11, R22, R33 and, when enabled by INFLOW_MODE, u'w' use
-    #     the actual windlespy Wong update without additional relaxation.  The
-    #     core applies only a final U >= 0.01 m/s positivity safeguard.
+    #     the unchanged windlespy Wong update. The only post-update safeguards
+    #     are U > 0 and Iu/Iv/Iw <= 0.50.
     #   - Spectral tilt direction is controlled by log(L_down/L_target).
+    #   - moment_relax and max_log_tilt are specified independently for u, v
+    #     and w using the two dictionaries above. There is no engineering
+    #     length-error deadband, control-error cap, or height smoothing.
     #   - No band-energy correction is applied.
     #   - Final auto-spectrum area is renormalised over the resolved frequency
     #     band to the Wong-updated variance.
+    case_override = {}
+    if IDE_CASE_PATH is not None:
+        case_override["case_dir"] = Path(IDE_CASE_PATH)
+
     cfg = default_config(
         mode="length_tilt",
         inflow_mode=INFLOW_MODE,
         components=("u", "v", "w"),
-        # Euston/full-scale frequency and length-scale controls.
-        # The core derives f_min from 1/T_record and f_max from the required
-        # setUp scalar maximumFrequency.  nperseg=0 selects a full-record Hann
-        # estimate on (or interpolated to) the spectraProfile frequency grid.
+        # Welch uses 4096-sample Hann segments with 50% overlap. Integral
+        # lengths use the original NHERI e-fold estimator. The active upper
+        # frequency remains the required setUp:maximumFrequency ceiling.
         f_min=0.0,
         f_max_update=float("inf"),
-        nperseg=0,
-        l_method="first_zero",
-        log_dir_name="eustonTower_spectralTiltCalibration_lengthTilt_noBands",
+        nperseg=4096,
+        l_method="efold",
+        log_dir_name="eustonTower_spectralTiltCalibration_simplified_welch4096_efold",
         variance_relax=0.0,
-        moment_relax=0.70,
+        # r_i in the controller equation is MOMENT_RELAX[i]. MAX_LOG_TILT[i]
+        # is the separate hard per-bin limit on g_i(f).
+        moment_relax=MOMENT_RELAX,
+        max_log_tilt=MAX_LOG_TILT,
         shape_relax=0.0,
         use_windlespy_wong_update=True,
         wong_relaxation_factor=0.9,
-        max_log_band_update=1.50,
-        max_log_tilt=1.40,
-        max_log_uw_update=1.10,
+        max_turbulence_intensity=0.50,
         update_profile_intensity=True,
         update_profile_length=False,
         # These are enforced from inflow_mode by the common engine. They are
@@ -76,6 +110,7 @@ def main() -> int:
         update_uw_cospectrum=False,
         use_windlespy_resolved_band=True,
         uw_cospectrum_resolved_band_only=True,
+        **case_override,
     )
     return int(run_calibration(cfg))
 
